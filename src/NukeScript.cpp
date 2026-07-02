@@ -367,6 +367,87 @@ static void BindReflectedStatics(lua_State* L)
     lua_pop(L, 1);
 }
 
+// ---- generic reflected-OBJECT dispatch (non-component engine objects: Transform, ...) --
+// Bound method call for an object reached through a live pointer (LuaBridge class
+// userdata): upvalues = (obj lightuserdata, typeName, methodName). Same lifetime contract
+// as the pointer binding itself — the closure is produced per-access and used immediately.
+static int ObjMethodCall(lua_State* L)
+{
+    void* obj = lua_touserdata(L, lua_upvalueindex(1));
+    const char* tname = lua_tostring(L, lua_upvalueindex(2));
+    const char* mname = lua_tostring(L, lua_upvalueindex(3));
+    TypeInfo* ti = Registry_Find(tname);
+    const Method* m = ti ? Reflect_FindMethod(ti, mname) : nullptr;
+    if (!m || !obj) return luaL_error(L, "%s.%s vanished", tname ? tname : "?", mname ? mname : "?");
+
+    const int base = lua_isuserdata(L, 1) ? 2 : 1;   // colon call: self sits at slot 1
+    const size_t nargs = m->params.size();
+    if ((size_t)(lua_gettop(L) - base + 1) < nargs)
+        return luaL_error(L, "%s:%s expects %d argument(s)", tname, mname, (int)nargs);
+    std::vector<ReflectValue> args(nargs);
+    for (size_t i = 0; i < nargs; ++i)
+    {
+        ReflectValue blank; blank.type = m->params[i];
+        if (!ReadReflectValue(L, base + (int)i, m->params[i], blank, args[i]))
+            return luaL_error(L, "%s:%s: bad argument #%d", tname, mname, (int)i + 1);
+    }
+    ReflectValue ret;
+    if (!Reflect_Invoke(obj, *m, args.data(), nargs, ret))
+        return luaL_error(L, "%s:%s: invoke failed", tname, mname);
+    if (ret.type == FT::Unknown) return 0;
+    return PushReflectValue(L, ret);
+}
+
+// __index over the reflection registry: fields by name (FT::Vec3 comes back as a LIVE
+// Vector3* so nested writes — `t.position.y = 1` — mutate in place, exactly like the old
+// hand-written binding), [[nuke::func]] methods as bound closures. Reusable for any
+// reflected engine object exposed as a LuaBridge class.
+static lb::LuaRef ReflectedIndex(void* obj, TypeInfo* ti, const lb::LuaRef& key, lua_State* L)
+{
+    if (!ti || !key.isString()) return lb::LuaRef(L);
+    const std::string k = key.tostring();
+    if (const Field* f = Reflect_FindField(ti, k))
+    {
+        if (f->type == FT::Vec3)
+        {
+            if (!lb::push(L, (Vector3*)f->addr(obj))) lua_pushnil(L);
+        }
+        else
+            PushReflectValue(L, Reflect_GetField(obj, *f));
+        lb::LuaRef ref = lb::LuaRef::fromStack(L, -1);
+        lua_pop(L, 1);
+        return ref;
+    }
+    if (Reflect_FindMethod(ti, k))
+    {
+        lua_pushlightuserdata(L, obj);
+        lua_pushstring(L, ti->name.c_str());
+        lua_pushstring(L, k.c_str());
+        lua_pushcclosure(L, ObjMethodCall, 3);
+        lb::LuaRef ref = lb::LuaRef::fromStack(L, -1);
+        lua_pop(L, 1);
+        return ref;
+    }
+    return lb::LuaRef(L);   // unknown name: nil
+}
+
+// __newindex over the registry: reflected field writes (t.position = v, t.eulerHint = {…}).
+static lb::LuaRef ReflectedNewIndex(void* obj, TypeInfo* ti, const lb::LuaRef& key,
+                                    const lb::LuaRef& value, lua_State* L)
+{
+    if (!ti || !key.isString()) return lb::LuaRef(L);
+    const std::string k = key.tostring();
+    const Field* f = Reflect_FindField(ti, k);
+    if (!f) { luaL_error(L, "%s has no property '%s'", ti->name.c_str(), k.c_str()); return lb::LuaRef(L); }
+    value.push();
+    ReflectValue v;
+    const bool ok = ReadReflectValue(L, -1, f->type, Reflect_GetField(obj, *f), v);
+    lua_pop(L, 1);
+    if (!ok) { luaL_error(L, "%s.%s: bad value", ti->name.c_str(), k.c_str()); return lb::LuaRef(L); }
+    Reflect_SetField(obj, *f, v);
+    return lb::LuaRef(L);
+}
+
 static void BindEngineAPI(lua_State* L)
 {
     RegisterComponentProxy(L);
@@ -384,17 +465,16 @@ static void BindEngineAPI(lua_State* L)
                     [](const Vector3* v) { return v->z; },
                     [](Vector3* v, double d) { v->z = d; })
             .endClass()
+            // Transform: NO hand-written members — __index/__newindex dispatch through the
+            // reflection registry ([[nuke::prop]] fields incl. live Vector3*, [[nuke::func]]
+            // methods incl. the legacy setEuler/euler aliases, which are reflected methods).
             .beginClass<Transform>("Transform")
-                .addProperty("position",
-                    [](Transform* t) -> Vector3* { return &t->position; },
-                    [](Transform* t, Vector3 v) { t->position = v; })
-                .addProperty("scale",
-                    [](Transform* t) -> Vector3* { return &t->scale; },
-                    [](Transform* t, Vector3 v) { t->scale = v; })
-                .addFunction("setEuler",
-                    [](Transform* t, double x, double y, double z) { t->SetEulerDeg(Vector3(x, y, z)); })
-                .addFunction("euler",
-                    [](Transform* t) { return t->EulerDeg(); })
+                .addIndexMetaMethod(+[](Transform& t, const lb::LuaRef& key, lua_State* LL) {
+                    return ReflectedIndex(&t, &TypeOf<Transform>(), key, LL);
+                })
+                .addNewIndexMetaMethod(+[](Transform& t, const lb::LuaRef& key, const lb::LuaRef& value, lua_State* LL) {
+                    return ReflectedNewIndex(&t, &TypeOf<Transform>(), key, value, LL);
+                })
             .endClass()
             .beginClass<Atom>("Atom")
                 .addProperty("transform",
@@ -414,8 +494,9 @@ static void BindEngineAPI(lua_State* L)
                         return c ? MakeComponentRef(L, a, c) : lb::LuaRef(L);
                     })
             .endClass()
-            .addFunction("time",  [] { return Time::getSingleton()->elapsed; })
-            .addFunction("delta", [] { return Time::getSingleton()->delta; })
+            // LEGACY aliases (older scripts): the reflected surface is nuke.Time.Elapsed()/Delta().
+            .addFunction("time",  [] { return Time::Elapsed(); })
+            .addFunction("delta", [] { return Time::Delta(); })
             // Every component type a script can getComponent/addComponent (reflection registry).
             .addFunction("componentTypes",
                 [](lua_State* L) -> lb::LuaRef {
@@ -425,7 +506,8 @@ static void BindEngineAPI(lua_State* L)
                     return t;
                 })
         .endNamespace()
-        // Runtime immediate-mode GUI for scripts' gui(self) — forwards to the engine facade (NukeGUI backend).
+        // LEGACY alias namespace (older scripts + the template use gui.begin/done); the
+        // reflected surface is nuke.Gui.* (auto-bound from [[nuke::func]] statics).
         .beginNamespace("gui")
             .addFunction("begin",     [](const char* n) { return nuke::GUI()->Begin(n); })
             .addFunction("done",      [] { nuke::GUI()->End(); })
