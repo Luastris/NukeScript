@@ -1,0 +1,25 @@
+# Build output
+build/
+[Bb]in/
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.dll
+*.tlog
+*.lastbuildstate
+
+# Third-party backend — its own upstream git, 905 MB; not part of our renderer source.
+deps/DiligentEngine/
+
+# Visual Studio / IDE
+.vs/
+*.user
+*.suo
+
+# logs / OS
+*.log
+Thumbs.db
+.DS_Store
