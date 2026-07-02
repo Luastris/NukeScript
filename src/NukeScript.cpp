@@ -16,11 +16,13 @@
 #include <interface/NUKEEInteface.h>   // NUKEModule + AppInstance
 #include <interface/AssetCreators.h>   // register a "New Lua Script" browser command (data only)
 #include <interface/iGUI.h>            // runtime GUI facade (scripts' gui() draws via this)
+#include <service/iScript.h>           // the scripting SERVICE contract this plugin provides
 #include <reflect/Reflect.h>
 #include <reflect/ReflectBind.h>       // reflection->script layer: generic component access (0.8)
 #include <API/Model/Atom.h>
 #include <API/Model/Transform.h>
 #include <API/Model/Time.h>
+#include <API/Model/World.h>           // World::Settings (fixedUpdate dt) + game lock
 
 #include <lua.hpp>
 #include <LuaBridge/LuaBridge.h>
@@ -29,6 +31,7 @@
 #include <fstream>
 #include <sstream>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -98,6 +101,12 @@ static int PushReflectValue(lua_State* L, const ReflectValue& v)
             lua_pushnumber(L, v.v[2]); lua_setfield(L, -2, "b");
             lua_pushnumber(L, v.v[3]); lua_setfield(L, -2, "a");
             break;
+        case FT::AtomRef:
+        {
+            Atom* a = Reflect_AtomById(v.atom);   // stale-safe: dead id -> nil
+            if (!a || !lb::push(L, a)) lua_pushnil(L);
+            break;
+        }
         default: lua_pushnil(L); break;
     }
     return 1;
@@ -166,6 +175,16 @@ static bool ReadReflectValue(lua_State* L, int idx, FT ft, const ReflectValue& c
             ReadTableSlot(L, idx, "b", out.v[2]);
             ReadTableSlot(L, idx, "a", out.v[3]);
             return true;
+        case FT::AtomRef:
+        {
+            if (lua_isnil(L, idx)) { out.atom = 0; return true; }
+            lb::LuaRef ref = lb::LuaRef::fromStack(L, idx);
+            if (!ref.isInstance<Atom>()) return false;
+            auto ta = ref.cast<Atom*>();
+            if (!ta) return false;
+            out.atom = Reflect_AtomId(*ta);
+            return true;
+        }
         default:
             return false;
     }
@@ -285,6 +304,69 @@ static lb::LuaRef MakeComponentRef(lua_State* L, Atom* atom, Component* c)
     return ref;
 }
 
+// Bound STATIC reflected function: nuke.<Type>.<Fn>(args...). Upvalues carry (typeName,
+// fnName) strings — resolved through the registry per call, so plugin re-registration
+// can never dangle. Fully reflection-driven: no per-facade wrappers anywhere.
+static int StaticFnCall(lua_State* L)
+{
+    const char* tname = lua_tostring(L, lua_upvalueindex(1));
+    const char* fname = lua_tostring(L, lua_upvalueindex(2));
+    TypeInfo* ti = Registry_Find(tname);
+    const Method* m = ti ? Reflect_FindMethod(ti, fname) : nullptr;
+    if (!m || !m->isStatic) return luaL_error(L, "nuke.%s.%s vanished (plugin toggled?)", tname, fname);
+
+    const size_t nargs = m->params.size();
+    if ((size_t)lua_gettop(L) < nargs)
+        return luaL_error(L, "nuke.%s.%s expects %d argument(s)", tname, fname, (int)nargs);
+    std::vector<ReflectValue> args(nargs);
+    for (size_t i = 0; i < nargs; ++i)
+    {
+        ReflectValue blank; blank.type = m->params[i];
+        if (!ReadReflectValue(L, 1 + (int)i, m->params[i], blank, args[i]))
+            return luaL_error(L, "nuke.%s.%s: bad argument #%d", tname, fname, (int)i + 1);
+    }
+    ReflectValue ret;
+    if (!Reflect_Invoke(nullptr, *m, args.data(), nargs, ret))
+        return luaL_error(L, "nuke.%s.%s: invoke failed", tname, fname);
+    if (ret.type == FT::Unknown) return 0;   // void
+    return PushReflectValue(L, ret);
+}
+
+// Walk the reflection registry and expose every [[nuke::func]] STATIC method as
+// nuke.<Type>.<Fn> — facades (Physics, ...) become scriptable with zero hand-written glue.
+static void BindReflectedStatics(lua_State* L)
+{
+    lua_getglobal(L, "nuke");
+    if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+    for (TypeInfo* ti : Registry_All())
+    {
+        if (!ti) continue;
+        bool any = false;
+        for (const Method& m : ti->methods)
+        {
+            if (!m.isStatic) continue;
+            if (!any)
+            {
+                lua_newtable(L);
+                any = true;
+            }
+            lua_pushstring(L, m.name.c_str());        // key
+            lua_pushstring(L, ti->name.c_str());      // upvalue 1: type name
+            lua_pushstring(L, m.name.c_str());        // upvalue 2: fn name
+            lua_pushcclosure(L, StaticFnCall, 2);     // value
+            lua_rawset(L, -3);                        // subtable[fn] = closure
+        }
+        if (any)
+        {
+            // rawset: the LuaBridge namespace table is __newindex-protected (read-only).
+            lua_pushstring(L, ti->name.c_str());
+            lua_insert(L, -2);                        // key under the subtable
+            lua_rawset(L, -3);                        // nuke[Type] = subtable
+        }
+    }
+    lua_pop(L, 1);
+}
+
 static void BindEngineAPI(lua_State* L)
 {
     RegisterComponentProxy(L);
@@ -354,6 +436,8 @@ static void BindEngineAPI(lua_State* L)
             .addFunction("checkbox",  [](const char* l, bool v)  { nuke::GUI()->Checkbox(l, &v); return v; })
             .addFunction("slider",    [](const char* l, float v, float lo, float hi) { nuke::GUI()->SliderFloat(l, &v, lo, hi); return v; })
         .endNamespace();
+
+    BindReflectedStatics(L);   // nuke.<Type>.<Fn> for every [[nuke::func]] static (e.g. nuke.Physics.Raycast)
 }
 
 static void EnsureLua()
@@ -409,10 +493,42 @@ public:
         }
     }
 
+    // Fixed-rate script hook: `fixedUpdate(self, dt)` at the world's fixedDt cadence.
+    // Called by World's FIXED THREAD under the game lock — the same lock every other VM
+    // entry (Update, OnGUI, contact hooks) holds, so the shared VM is cross-thread safe.
+    void FixedUpdate() override
+    {
+        if (!EnsureLoaded()) return;
+        lb::LuaRef fu = (*table)["fixedUpdate"];
+        if (!fu.isFunction()) return;
+        World* w = AppInstance::GetSingleton()->currentScene;
+        double dt = (w && w->settings.fixedDt > 0.0001f) ? w->settings.fixedDt : 1.0 / 60.0;
+        try { fu(atom, dt); }
+        catch (const lb::LuaException& e)
+        {
+            cerr << "[NukeScript]\tfixedUpdate error: " << e.what() << endl;
+            Clear();
+        }
+    }
+
+    // ---- physics contact hooks -------------------------------------------------------
+    // Dispatched by the FIXED THREAD under the game lock -> the VM is safe to enter
+    // DIRECTLY (no queueing, no frame delay). Script hooks:
+    // onCollisionEnter/onCollisionExit/onTriggerEnter/onTriggerExit(self, other).
+    void OnCollisionEnter(Atom* other) override { CallContactHook("onCollisionEnter", other); }
+    void OnCollisionExit(Atom* other) override  { CallContactHook("onCollisionExit", other); }
+    void OnTriggerEnter(Atom* other) override   { CallContactHook("onTriggerEnter", other); }
+    void OnTriggerExit(Atom* other) override    { CallContactHook("onTriggerExit", other); }
+
     // DATA only — expose the script's exported props (the editor renders + edits them).
+    // Runs on the editor's render thread: take the game lock — the fixed thread may be
+    // inside this same VM (fixedUpdate/contact hooks).
     std::vector<DynProp> DynamicProps() override
     {
         std::vector<DynProp> out;
+        World* w = AppInstance::GetSingleton()->currentScene;
+        struct Guard { World* w; ~Guard() { if (w) w->UnlockGame(); } } guard{ w };
+        if (w) w->LockGame();
         if (!EnsureLoaded() || !propsTable || propsTable->isNil())
             return out;
         json defs = defaultsJson.empty() ? json::object() : json::parse(defaultsJson, nullptr, false);
@@ -430,6 +546,9 @@ public:
 
     void SetDynamicProp(const std::string& name, const NukeVar& v) override
     {
+        World* w = AppInstance::GetSingleton()->currentScene;
+        struct Guard { World* w; ~Guard() { if (w) w->UnlockGame(); } } guard{ w };
+        if (w) w->LockGame();
         if (!EnsureLoaded() || !propsTable) return;
         switch (v.kind)
         {
@@ -455,7 +574,6 @@ public:
         }
     }
 
-    void FixedUpdate() override {}
     void Pause() override       {}
     void Reset() override       { Clear(); }
 
@@ -464,6 +582,19 @@ private:
     lb::LuaRef* propsTable = nullptr;   // table["props"] (the exported props)
     std::string loadedScript;           // path the current chunk came from (for reload-on-change)
     std::string defaultsJson;           // script's original prop defaults (for the reset button)
+
+    // Direct contact-hook dispatch (fixed thread, game lock held by the caller).
+    void CallContactHook(const char* fnName, Atom* other)
+    {
+        if (!EnsureLoaded()) return;
+        lb::LuaRef fn = (*table)[fnName];
+        if (!fn.isFunction()) return;
+        try { fn(atom, other); }
+        catch (const lb::LuaException& ex)
+        {
+            cerr << "[NukeScript]\t" << fnName << " error: " << ex.what() << endl;
+        }
+    }
 
     void Clear()
     {
@@ -593,6 +724,29 @@ static bool RegisterScriptComponent()
 // ----------------------------------------------------------------------------
 // Plugin
 // ----------------------------------------------------------------------------
+// The scripting service implementation (iScript, kServiceName "scripting"): snippets run
+// in the SAME shared VM as ScriptComponents, so a console line can poke live script state.
+struct LuaScriptService : public iScript
+{
+    const char* Language() override { return "lua"; }
+
+    bool Run(const char* code, const char* chunkName) override
+    {
+        if (!code) return false;
+        EnsureLua();
+        if (luaL_loadbuffer(gL, code, strlen(code), chunkName ? chunkName : "snippet") != LUA_OK
+            || lua_pcall(gL, 0, 0, 0) != LUA_OK)
+        {
+            cerr << "[NukeScript]\tRun('" << (chunkName ? chunkName : "snippet")
+                 << "') error: " << lua_tostring(gL, -1) << endl;
+            lua_pop(gL, 1);
+            return false;
+        }
+        return true;
+    }
+};
+static LuaScriptService gScriptService;
+
 struct NukeScriptModule : public NUKEModule
 {
     NukeScriptModule()
@@ -606,9 +760,10 @@ struct NukeScriptModule : public NUKEModule
     }
 
     // Service metadata: the active scripting backend (one at a time; a future C#/Mono
-    // plugin provides the same service). No queryService yet — the shared script-service
-    // interface arrives with the reflection->binding layer (roadmap 0.8).
+    // plugin provides the same iScript service). The loader registers queryService()
+    // under "scripting"; consumers use GetService<iScript>() / the Script facade.
     const char* provides() override { return "scripting"; }
+    void*       queryService() override { return static_cast<iScript*>(&gScriptService); }
 
     // Activation hook (sync, before Run). Register ScriptComponent here so the type only
     // exists while the plugin is enabled — disabled, its components stay inert placeholders.
@@ -635,6 +790,17 @@ struct NukeScriptModule : public NUKEModule
             "        -- local light = self:getComponent(\"Light\")\n"
             "        -- if light then light.intensity = 5 end\n"
             "    end,\n"
+            "    -- Fixed-rate tick (physics cadence, frame-independent):\n"
+            "    -- fixedUpdate = function(self, dt) end,\n"
+            "    -- Physics hooks (need a Collider on this atom):\n"
+            "    -- onCollisionEnter = function(self, other) end,\n"
+            "    -- onCollisionExit  = function(self, other) end,\n"
+            "    -- onTriggerEnter   = function(self, other) end,\n"
+            "    -- onTriggerExit    = function(self, other) end,\n"
+            "    -- Ray cast (reflected facade, nuke.Physics.*):\n"
+            "    -- if nuke.Physics.Raycast(from, dir, 100) then\n"
+            "    --     local a = nuke.Physics.HitAtom(); local d = nuke.Physics.HitDistance()\n"
+            "    -- end\n"
             "    -- Runtime UI (drawn while playing); always pair begin/done.\n"
             "    gui = function(self)\n"
             "        gui.begin(\"Script UI\")\n"
