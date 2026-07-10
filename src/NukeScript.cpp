@@ -656,6 +656,19 @@ public:
         }
     }
 
+    // Animation event from the sibling Animator (3.1). Game thread with the game lock
+    // held (same contract as OnGUI) — enter the VM directly: animEvent(self, name).
+    void OnAnimEvent(const char* name) override
+    {
+        if (!EnsureLoaded()) return;
+        lb::LuaRef h = (*table)["animEvent"];
+        if (h.isFunction())
+        {
+            try { h(atom, std::string(name ? name : "")); }
+            catch (const lb::LuaException& e) { cerr << "[NukeScript]\tanimEvent error: " << e.what() << endl; Clear(); }
+        }
+    }
+
     void Pause() override       {}
     void Reset() override       { Clear(); }
 
@@ -695,9 +708,11 @@ private:
         Clear();
         loadedScript = script;
 
-        // Resolve relative to the project content root (not the exe root), with a cwd fallback.
-        std::string resolved = AppInstance::GetSingleton()->ResolveContent(script);
-        std::string src = ReadFile(resolved);
+        // Read through the engine's content layers: the raw project/overlay from disk,
+        // mounted paks from MEMORY (a packed game never lays scripts out on disk).
+        std::string resolved = script;
+        std::string src;
+        AppInstance::GetSingleton()->ReadContent(script, src);
         if (src.empty())
         {
             cerr << "[NukeScript]\tcannot read script '" << script << "' (resolved: " << resolved << ")" << endl;
@@ -846,6 +861,34 @@ struct NukeScriptModule : public NUKEModule
     // under "scripting"; consumers use GetService<iScript>() / the Script facade.
     const char* provides() override { return "scripting"; }
     void*       queryService() override { return static_cast<iScript*>(&gScriptService); }
+
+    // Shipping cooker (3.2): .lua sources are THIS module's domain — the editor packs them
+    // only because we claim them, and we report what they use: every quoted literal is a
+    // potential asset reference (Game.LoadWorld / Audio.Play / getComponent props / ...);
+    // the editor resolves each against ResDB guids + content paths and walks recursively.
+    // Dynamically composed strings are invisible statically — projects force-include those
+    // via "packInclude" in the .nuproj.
+    bool cookContent(const char* contentRel, const char* bytes, uint64_t size,
+                     std::vector<std::string>& outUses) override
+    {
+        std::string rel = contentRel ? contentRel : "";
+        for (char& c : rel) c = (char)tolower((unsigned char)c);
+        if (rel.size() < 4 || rel.compare(rel.size() - 4, 4, ".lua") != 0) return false;
+        const char* src = bytes;
+        for (uint64_t i = 0; src && i < size; ++i)
+        {
+            char q = src[i];
+            if (q != '"' && q != '\'') continue;
+            uint64_t e = i + 1;
+            while (e < size && src[e] != q && src[e] != '\n') ++e;
+            if (e < size && src[e] == q)
+            {
+                if (e - i > 1 && e - i < 512) outUses.emplace_back(src + i + 1, (size_t)(e - i - 1));
+                i = e;
+            }
+        }
+        return true;   // .lua is ours — it ships (with the scripting module present)
+    }
 
     // Activation hook (sync, before Run). Register ScriptComponent here so the type only
     // exists while the plugin is enabled — disabled, its components stay inert placeholders.
