@@ -23,6 +23,7 @@
 #include <API/Model/Transform.h>
 #include <API/Model/Time.h>
 #include <API/Model/World.h>           // World::Settings (fixedUpdate dt) + game lock
+#include <API/Model/Audio.h>           // sound content: PlayData blob channel
 
 #include <lua.hpp>
 #include <LuaBridge/LuaBridge.h>
@@ -60,6 +61,14 @@ static lua_State* gL = nullptr;
 // ----------------------------------------------------------------------------
 struct CompRef { unsigned long atomId; unsigned long compId; };
 static const char* kCompMeta = "nuke.Component";
+
+// Reflected OBJECT handles (task #67, defined below the component proxy): every reflected
+// Model class is first-class in Lua too — create/find/edit/assign, never a guid in user
+// code. Forward pieces the component proxy uses to expose asset-ref fields as objects.
+struct ObjRef { unsigned long id; };
+static const char* kObjMeta = "nuke.Object";
+static int PushObjHandle(lua_State* L, unsigned long id);
+static const Field* AssetAliasField(const TypeInfo* ti, const std::string& key);
 
 static Component* CompRefResolve(lua_State* L, int idx)
 {
@@ -140,6 +149,12 @@ static bool ReadReflectValue(lua_State* L, int idx, FT ft, const ReflectValue& c
             return true;
         case FT::String:
         {
+            // An object handle where a string is expected = an asset reference: its guid.
+            if (ObjRef* o = (ObjRef*)luaL_testudata(L, idx, kObjMeta))
+            {
+                out.str = Reflect_ObjectGuid(o->id);
+                return true;
+            }
             const char* s = lua_tostring(L, idx);
             if (!s) return false;
             out.str = s;
@@ -252,6 +267,16 @@ static int CompIndex(lua_State* L)
         lua_pushcclosure(L, CompMethodCall, 3);
         return 1;
     }
+    // OBJECT view of an asset-reference field: `mr.mesh` (field meshGuid) yields a live
+    // object handle; the raw `mr.meshGuid` string stays available for tooling.
+    if (const Field* af = AssetAliasField(c->GetType(), key))
+        return PushObjHandle(L, Reflect_ObjectFromGuid(Reflect_GetField(c, *af).str));
+    // A component-OWNED object: `mr.material` -> its live material instance.
+    {
+        CompRef* r = (CompRef*)lua_touserdata(L, 1);
+        if (unsigned long oid = Reflect_ComponentObject(r->atomId, r->compId, key))
+            return PushObjHandle(L, oid);
+    }
     lua_pushnil(L);                                      // unknown name: Lua-idiomatic nil
     return 1;
 }
@@ -263,14 +288,21 @@ static int CompNewIndex(lua_State* L)
     if (!c) return luaL_error(L, "nuke.Component: component no longer exists (stale handle)");
     if (strcmp(key, "enabled") == 0) { c->enabled = lua_toboolean(L, 3) != 0; return 0; }
     const Field* f = Reflect_FindField(c->GetType(), key);
+    if (!f) f = AssetAliasField(c->GetType(), key);      // `mr.mesh = obj` writes meshGuid
     if (!f)
         return luaL_error(L, "nuke.Component: '%s' has no property '%s'",
                           c->GetType() ? c->GetType()->name.c_str() : c->name, key);
     ReflectValue v;
-    if (!ReadReflectValue(L, 3, f->type, Reflect_GetField(c, *f), v))
+    if (!f->asset.empty() && lua_isnil(L, 3))            // nil clears an asset reference
+    {
+        v.type = FT::String;
+        v.str.clear();
+    }
+    else if (!ReadReflectValue(L, 3, f->type, Reflect_GetField(c, *f), v))
         return luaL_error(L, "nuke.Component: bad value for '%s.%s'",
                           c->GetType() ? c->GetType()->name.c_str() : c->name, key);
     Reflect_SetField(c, *f, v);
+    Reflect_ComponentFieldChanged(c, *f);                // asset writes take effect this frame
     return 0;
 }
 
@@ -304,6 +336,212 @@ static lb::LuaRef MakeComponentRef(lua_State* L, Atom* atom, Component* c)
     return ref;
 }
 
+// ----------------------------------------------------------------------------
+// Reflected OBJECT handles (task #67). A nuke.Object userdata carries only an engine
+// handle id (ReflectBind's ObjTable) — the same table C# rides on, so both languages see
+// the same objects. __index/__newindex dispatch fields + [[nuke::func]] methods through
+// the registry; asset-reference fields read/write as OBJECTS (never guids in user code).
+// Builtins: valid, guid, type; Texture adds setPixels(w, h, rgbaString).
+// ----------------------------------------------------------------------------
+static int PushObjHandle(lua_State* L, unsigned long id)
+{
+    if (!id) { lua_pushnil(L); return 1; }
+    ObjRef* r = (ObjRef*)lua_newuserdata(L, sizeof(ObjRef));
+    r->id = id;
+    luaL_setmetatable(L, kObjMeta);
+    return 1;
+}
+
+// The OBJECT view of an asset-reference field: for a missing key `mesh`, matches the
+// reflected `meshGuid` string field carrying asset metadata. Direct names always win.
+static const Field* AssetAliasField(const TypeInfo* ti, const std::string& key)
+{
+    if (!ti || key.empty() || Reflect_FindField(ti, key)) return nullptr;
+    const Field* f = Reflect_FindField(ti, key + "Guid");
+    return (f && f->type == FT::String && !f->asset.empty()) ? f : nullptr;
+}
+
+static int ObjMethodInvoke(lua_State* L)   // upvalues: (objId, methodName)
+{
+    unsigned long id  = (unsigned long)lua_tointeger(L, lua_upvalueindex(1));
+    const char*   mname = lua_tostring(L, lua_upvalueindex(2));
+    TypeInfo* ti = Registry_Find(Reflect_ObjectType(id));
+    const Method* m = ti ? Reflect_FindMethod(ti, mname) : nullptr;
+    if (!m) return luaL_error(L, "nuke.Object: method '%s' on a dead handle", mname);
+
+    const int base = luaL_testudata(L, 1, kObjMeta) ? 2 : 1;   // colon call: self at slot 1
+    const size_t nargs = m->params.size();
+    if ((size_t)(lua_gettop(L) - base + 1) < nargs)
+        return luaL_error(L, "nuke.Object: %s expects %d argument(s)", mname, (int)nargs);
+    std::vector<ReflectValue> args(nargs);
+    for (size_t i = 0; i < nargs; ++i)
+    {
+        ReflectValue blank; blank.type = m->params[i];
+        if (!ReadReflectValue(L, base + (int)i, m->params[i], blank, args[i]))
+            return luaL_error(L, "nuke.Object: bad argument #%d to %s", (int)i + 1, mname);
+    }
+    ReflectValue ret;
+    if (!Reflect_ObjectInvoke(id, mname, args.data(), nargs, ret))
+        return luaL_error(L, "nuke.Object: invoking %s failed", mname);
+    if (ret.type == FT::Unknown) return 0;
+    return PushReflectValue(L, ret);
+}
+
+// Texture CONTENT: tex:setPixels(w, h, rgba) — rgba is a Lua string (the idiomatic byte
+// buffer), tightly packed RGBA8, #rgba == w*h*4. Uploads live via the engine blob channel.
+static int ObjSetPixels(lua_State* L)
+{
+    ObjRef* r = (ObjRef*)luaL_checkudata(L, 1, kObjMeta);
+    int w = (int)luaL_checkinteger(L, 2);
+    int h = (int)luaL_checkinteger(L, 3);
+    size_t len = 0;
+    const char* p = luaL_checklstring(L, 4, &len);
+    lua_pushboolean(L, Reflect_SetTexturePixels(r->id, w, h, p, len));
+    return 1;
+}
+
+// Mesh CONTENT: mesh:setGeometry(verts [, normals [, uvs]]) — flat number arrays, an
+// unindexed TRIANGLE LIST (verts = 9*T numbers; normals same length, optional -> flat
+// per-triangle computed; uvs = 2 per vertex, optional -> zeros).
+static bool ReadFloatArray(lua_State* L, int idx, std::vector<float>& out)
+{
+    if (!lua_istable(L, idx)) return false;
+    size_t n = lua_rawlen(L, idx);
+    out.resize(n);
+    for (size_t i = 1; i <= n; ++i)
+    {
+        lua_rawgeti(L, idx, (lua_Integer)i);
+        if (!lua_isnumber(L, -1)) { lua_pop(L, 1); return false; }
+        out[i - 1] = (float)lua_tonumber(L, -1);
+        lua_pop(L, 1);
+    }
+    return true;
+}
+
+static int ObjSetGeometry(lua_State* L)
+{
+    ObjRef* r = (ObjRef*)luaL_checkudata(L, 1, kObjMeta);
+    std::vector<float> v, n, u;
+    if (!ReadFloatArray(L, 2, v) || v.empty() || v.size() % 9 != 0)
+        return luaL_error(L, "setGeometry: vertices must be a flat array of 9*T numbers (triangle list)");
+    const bool hasN = lua_istable(L, 3);
+    const bool hasU = lua_istable(L, 4);
+    if (hasN && (!ReadFloatArray(L, 3, n) || n.size() != v.size()))
+        return luaL_error(L, "setGeometry: normals must match vertices (3 numbers per vertex)");
+    if (hasU && (!ReadFloatArray(L, 4, u) || u.size() != v.size() / 3 * 2))
+        return luaL_error(L, "setGeometry: uvs must be 2 numbers per vertex");
+    lua_pushboolean(L, Reflect_SetMeshGeometry(r->id, (int)(v.size() / 3), v.data(),
+                                               hasN ? n.data() : nullptr,
+                                               hasU ? u.data() : nullptr));
+    return 1;
+}
+
+static int ObjIndex(lua_State* L)
+{
+    ObjRef* r = (ObjRef*)luaL_checkudata(L, 1, kObjMeta);
+    const char* key = luaL_checkstring(L, 2);
+    TypeInfo* ti = Registry_Find(Reflect_ObjectType(r->id));
+    if (strcmp(key, "valid") == 0) { lua_pushboolean(L, ti != nullptr); return 1; }
+    if (!ti) { lua_pushnil(L); return 1; }               // dead handle: reads yield nil
+    if (strcmp(key, "guid") == 0)
+    {
+        std::string g = Reflect_ObjectGuid(r->id);
+        lua_pushlstring(L, g.data(), g.size());
+        return 1;
+    }
+    if (strcmp(key, "type") == 0) { lua_pushstring(L, ti->name.c_str()); return 1; }
+    if (strcmp(key, "setPixels") == 0 && ti->name == "Texture")
+    {
+        lua_pushcfunction(L, ObjSetPixels);
+        return 1;
+    }
+    if (strcmp(key, "setGeometry") == 0 && ti->name == "Mesh")
+    {
+        lua_pushcfunction(L, ObjSetGeometry);
+        return 1;
+    }
+    if (Reflect_FindField(ti, key))
+        return PushReflectValue(L, Reflect_ObjectGet(r->id, key));
+    if (Reflect_FindMethod(ti, key))
+    {
+        lua_pushinteger(L, (lua_Integer)r->id);
+        lua_pushstring(L, key);
+        lua_pushcclosure(L, ObjMethodInvoke, 2);
+        return 1;
+    }
+    if (const Field* af = AssetAliasField(ti, key))      // mat.shader / mat.diffuse -> objects
+        return PushObjHandle(L, Reflect_ObjectFromGuid(Reflect_ObjectGet(r->id, af->name).str));
+    lua_pushnil(L);
+    return 1;
+}
+
+static int ObjNewIndex(lua_State* L)
+{
+    ObjRef* r = (ObjRef*)luaL_checkudata(L, 1, kObjMeta);
+    const char* key = luaL_checkstring(L, 2);
+    TypeInfo* ti = Registry_Find(Reflect_ObjectType(r->id));
+    if (!ti) return luaL_error(L, "nuke.Object: dead handle");
+    const Field* f = Reflect_FindField(ti, key);
+    if (!f) f = AssetAliasField(ti, key);                // mat.shader = obj writes shaderGuid
+    if (!f) return luaL_error(L, "%s has no property '%s'", ti->name.c_str(), key);
+    ReflectValue v;
+    if (!f->asset.empty() && lua_isnil(L, 3))            // nil clears an asset reference
+    {
+        v.type = FT::String;
+        v.str.clear();
+    }
+    else if (!ReadReflectValue(L, 3, f->type, Reflect_ObjectGet(r->id, f->name), v))
+        return luaL_error(L, "%s.%s: bad value", ti->name.c_str(), key);
+    if (!Reflect_ObjectSet(r->id, f->name, v))           // engine re-resolves asset refs
+        return luaL_error(L, "%s.%s: write failed", ti->name.c_str(), key);
+    return 0;
+}
+
+static int ObjToString(lua_State* L)
+{
+    ObjRef* r = (ObjRef*)luaL_checkudata(L, 1, kObjMeta);
+    const char* t = Reflect_ObjectType(r->id);
+    if (!*t) { lua_pushstring(L, "nuke.Object(<dead>)"); return 1; }
+    lua_pushfstring(L, "nuke.Object(%s)", t);
+    return 1;
+}
+
+static int ObjEq(lua_State* L)   // same engine handle = same object
+{
+    ObjRef* a = (ObjRef*)luaL_testudata(L, 1, kObjMeta);
+    ObjRef* b = (ObjRef*)luaL_testudata(L, 2, kObjMeta);
+    lua_pushboolean(L, a && b && a->id == b->id);
+    return 1;
+}
+
+static void RegisterObjectProxy(lua_State* L)
+{
+    luaL_newmetatable(L, kObjMeta);
+    lua_pushcfunction(L, ObjIndex);    lua_setfield(L, -2, "__index");
+    lua_pushcfunction(L, ObjNewIndex); lua_setfield(L, -2, "__newindex");
+    lua_pushcfunction(L, ObjToString); lua_setfield(L, -2, "__tostring");
+    lua_pushcfunction(L, ObjEq);       lua_setfield(L, -2, "__eq");
+    lua_pop(L, 1);
+}
+
+// Per-type factories: nuke.<Type>.Create()/Find(name)/FromGuid(guid). Upvalue = type name.
+static int TypeCreate(lua_State* L)
+{
+    return PushObjHandle(L, Reflect_CreateObject(lua_tostring(L, lua_upvalueindex(1))));
+}
+static int TypeFind(lua_State* L)
+{
+    return PushObjHandle(L, Reflect_FindAsset(lua_tostring(L, lua_upvalueindex(1)),
+                                              luaL_checkstring(L, 1)));
+}
+static int TypeFromGuid(lua_State* L)
+{
+    const char* tname = lua_tostring(L, lua_upvalueindex(1));
+    unsigned long id = Reflect_ObjectFromGuid(luaL_checkstring(L, 1));
+    if (id && strcmp(Reflect_ObjectType(id), tname) != 0) id = 0;   // wrong class -> nil
+    return PushObjHandle(L, id);
+}
+
 // Bound STATIC reflected function: nuke.<Type>.<Fn>(args...). Upvalues carry (typeName,
 // fnName) strings — resolved through the registry per call, so plugin re-registration
 // can never dangle. Fully reflection-driven: no per-facade wrappers anywhere.
@@ -334,6 +572,8 @@ static int StaticFnCall(lua_State* L)
 
 // Walk the reflection registry and expose every [[nuke::func]] STATIC method as
 // nuke.<Type>.<Fn> — facades (Physics, ...) become scriptable with zero hand-written glue.
+// Every creatable NON-component type additionally gets the object factories
+// Create()/Find(name)/FromGuid(guid) (components go through atom:addComponent instead).
 static void BindReflectedStatics(lua_State* L)
 {
     lua_getglobal(L, "nuke");
@@ -341,20 +581,48 @@ static void BindReflectedStatics(lua_State* L)
     for (TypeInfo* ti : Registry_All())
     {
         if (!ti) continue;
+        const bool factories = ti->create && ti->base != "Component";
         bool any = false;
+        auto ensureTable = [&] { if (!any) { lua_newtable(L); any = true; } };
         for (const Method& m : ti->methods)
         {
             if (!m.isStatic) continue;
-            if (!any)
-            {
-                lua_newtable(L);
-                any = true;
-            }
+            ensureTable();
             lua_pushstring(L, m.name.c_str());        // key
             lua_pushstring(L, ti->name.c_str());      // upvalue 1: type name
             lua_pushstring(L, m.name.c_str());        // upvalue 2: fn name
             lua_pushcclosure(L, StaticFnCall, 2);     // value
             lua_rawset(L, -3);                        // subtable[fn] = closure
+        }
+        if (factories)
+        {
+            ensureTable();
+            struct { const char* name; lua_CFunction fn; } fns[] =
+                { { "Create", TypeCreate }, { "Find", TypeFind }, { "FromGuid", TypeFromGuid } };
+            for (auto& e : fns)
+            {
+                lua_pushstring(L, e.name);
+                lua_pushstring(L, ti->name.c_str());  // upvalue: type name
+                lua_pushcclosure(L, e.fn, 1);
+                lua_rawset(L, -3);
+            }
+        }
+        // Sound CONTENT: nuke.Audio.PlayData(bytes [, volume [, loop [, bus]]]) — encoded
+        // audio (ogg/wav/mp3/flac) as a Lua string; a blob, so hand-bound like setPixels.
+        if (ti->name == "Audio")
+        {
+            ensureTable();
+            lua_pushstring(L, "PlayData");
+            lua_pushcfunction(L, +[](lua_State* LL) -> int {
+                size_t len = 0;
+                const char* p = luaL_checklstring(LL, 1, &len);
+                double vol  = luaL_optnumber(LL, 2, 1.0);
+                bool   loop = lua_toboolean(LL, 3) != 0;
+                double bus  = luaL_optnumber(LL, 4, 1.0);
+                lua_pushnumber(LL, Audio::PlayData(p, (uint64_t)len, vol, loop, bus));
+                return 1;
+            });
+            lua_rawset(L, -3);
         }
         if (any)
         {
@@ -364,6 +632,37 @@ static void BindReflectedStatics(lua_State* L)
             lua_rawset(L, -3);                        // nuke[Type] = subtable
         }
     }
+    // nuke.Assets.find(name [, type]) — any-class asset lookup by name; .fromGuid(g).
+    lua_newtable(L);
+    lua_pushcfunction(L, +[](lua_State* LL) -> int {
+        const char* type = lua_isstring(LL, 2) ? lua_tostring(LL, 2) : "";
+        return PushObjHandle(LL, Reflect_FindAsset(type, luaL_checkstring(LL, 1)));
+    });
+    lua_setfield(L, -2, "find");
+    lua_pushcfunction(L, +[](lua_State* LL) -> int {
+        return PushObjHandle(LL, Reflect_ObjectFromGuid(luaL_checkstring(LL, 1)));
+    });
+    lua_setfield(L, -2, "fromGuid");
+    lua_pushstring(L, "Assets");
+    lua_insert(L, -2);
+    lua_rawset(L, -3);
+    // nuke.Packages.read(rel) — content bytes through the engine's layered resolution
+    // (raw project or mounted pak), as a Lua string; nil when absent.
+    lua_newtable(L);
+    lua_pushcfunction(L, +[](lua_State* LL) -> int {
+        std::string data;
+        if (!AppInstance::GetSingleton()->ReadContent(luaL_checkstring(LL, 1), data))
+        {
+            lua_pushnil(LL);
+            return 1;
+        }
+        lua_pushlstring(LL, data.data(), data.size());
+        return 1;
+    });
+    lua_setfield(L, -2, "read");
+    lua_pushstring(L, "Packages");
+    lua_insert(L, -2);
+    lua_rawset(L, -3);
     lua_pop(L, 1);
 }
 
@@ -451,6 +750,7 @@ static lb::LuaRef ReflectedNewIndex(void* obj, TypeInfo* ti, const lb::LuaRef& k
 static void BindEngineAPI(lua_State* L)
 {
     RegisterComponentProxy(L);
+    RegisterObjectProxy(L);
     lb::getGlobalNamespace(L)
         .beginNamespace("nuke")
             .beginClass<Vector3>("Vector3")
@@ -856,11 +1156,13 @@ struct NukeScriptModule : public NUKEModule
         tags = { "lua", "scripting", "gameplay" };
     }
 
-    // Service metadata: the active scripting backend (one at a time; a future C#/Mono
-    // plugin provides the same iScript service). The loader registers queryService()
-    // under "scripting"; consumers use GetService<iScript>() / the Script facade.
+    // Service metadata: scripting is a SHARED service — several backends (this Lua one,
+    // C#/Mono, native plugins) may be live at once, each with its own component types and
+    // file formats. The loader registers queryService() under "scripting"; consumers use
+    // GetService<iScript>() (first) / GetServices<iScript>() (all) / the Script facade.
     const char* provides() override { return "scripting"; }
     void*       queryService() override { return static_cast<iScript*>(&gScriptService); }
+    bool        sharedService() override { return true; }
 
     // Shipping cooker (3.2): .lua sources are THIS module's domain — the editor packs them
     // only because we claim them, and we report what they use: every quoted literal is a
@@ -914,6 +1216,14 @@ struct NukeScriptModule : public NUKEModule
             "        -- self is the atom; any reflected component works by type name:\n"
             "        -- local light = self:getComponent(\"Light\")\n"
             "        -- if light then light.intensity = 5 end\n"
+            "        -- Assets are OBJECTS (create/find/assign by name — never a guid):\n"
+            "        -- local mr = self:getComponent(\"MeshRenderer\")\n"
+            "        -- mr.mesh = nuke.Mesh.Find(\"builtin:sphere\")\n"
+            "        -- mr.material.shader = nuke.Shader.Find(\"world\")\n"
+            "        -- local tex = nuke.Texture.Create()\n"
+            "        -- tex:setPixels(w, h, rgbaString)   -- #rgbaString == w*h*4\n"
+            "        -- mr.material.diffuse = tex\n"
+            "        -- Content bytes (raw project or pak): nuke.Packages.read(\"path\")\n"
             "    end,\n"
             "    -- Fixed-rate tick (physics cadence, frame-independent):\n"
             "    -- fixedUpdate = function(self, dt) end,\n"
