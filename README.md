@@ -72,6 +72,54 @@ nuke.DebugDraw.Line(a, b, color)
 local t = nuke.Time.Elapsed()
 ```
 
+### Game & World — load worlds, spawn and destroy atoms
+
+```lua
+local w = nuke.Game.GetWorld()                -- the CURRENT world as an object
+print(w.name)
+
+local a = w:CreateAtom("Enemy")               -- new atom at the world root
+a:SetTag("hostile")
+a.transform.position = nuke.Vector3(0, 1, 0)
+a:addComponent("MeshRenderer")
+
+local player = w:Get("Player")                -- whole-tree lookup by name
+a:SetParent(player)                           -- parenting (nil = back to root)
+a:Destroy()                                   -- DEFERRED: removed at end of frame (safe on self)
+
+local boss = nuke.Prefabs.Instantiate("Prefabs/Boss.nuprefab")   -- spawn a saved subtree
+
+nuke.Game.LoadWorld("Worlds/level2.nuworld")  -- switch worlds (applied at the frame boundary)
+if nuke.Game.IsPaused() then nuke.Game.SetPaused(false) end
+nuke.Game.Quit()                              -- Player: close; editor: ignored (stop PIE yourself)
+```
+
+Atoms carry the reflected API too: `GetName/SetName`, `GetTag/SetTag`, `GetParent/SetParent`,
+`AddChild`, `Destroy`, plus the `name`/`tag` properties. World adds `GetById`, `Pick(origin, dir)`,
+`Reparent`, `QueueDestroy`, `SaveToString`/`LoadFromString`, `Clear`.
+
+### Window / video settings
+
+Each setter updates the window config, **persists it** (so the next launch uses it), and
+applies live (in the Player; the editor skips the live change but still saves for the game):
+
+```lua
+nuke.Game.SetResolution(1600, 900)
+nuke.Game.SetWindowMode(0)      -- 0 windowed, 1 borderless fullscreen, 2 exclusive fullscreen
+nuke.Game.SetBorderless(true)   -- windowed decoration off
+nuke.Game.SetOpacity(0.9)       -- whole-window 0..1 (live)
+nuke.Game.SetTransparent(true)  -- per-pixel alpha (takes effect on next launch)
+local w, m = nuke.Game.WindowWidth(), nuke.Game.WindowMode()   -- + WindowHeight/IsBorderless/Opacity
+```
+
+### Utilities
+
+```lua
+nuke.Log.Info("mygame", "reached checkpoint")   -- editor Console (also .Warn / .Error)
+local c = nuke.Clock.Create()                   -- pausable monotonic stopwatch
+c:Pause(); c:Resume(); print(c:Elapsed())
+```
+
 ### The object model — every Model class is first-class
 
 ```lua

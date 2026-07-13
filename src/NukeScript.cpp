@@ -116,6 +116,9 @@ static int PushReflectValue(lua_State* L, const ReflectValue& v)
             if (!a || !lb::push(L, a)) lua_pushnil(L);
             break;
         }
+        case FT::ObjectRef:                       // reflected instance -> nuke.Object handle
+            PushObjHandle(L, v.obj);              // 0 -> nil
+            break;
         default: lua_pushnil(L); break;
     }
     return 1;
@@ -198,6 +201,14 @@ static bool ReadReflectValue(lua_State* L, int idx, FT ft, const ReflectValue& c
             auto ta = ref.cast<Atom*>();
             if (!ta) return false;
             out.atom = Reflect_AtomId(*ta);
+            return true;
+        }
+        case FT::ObjectRef:
+        {
+            if (lua_isnil(L, idx)) { out.obj = 0; return true; }   // null object
+            ObjRef* r = (ObjRef*)luaL_testudata(L, idx, kObjMeta);
+            if (!r) return false;
+            out.obj = r->id;
             return true;
         }
         default:
@@ -581,7 +592,11 @@ static void BindReflectedStatics(lua_State* L)
     for (TypeInfo* ti : Registry_All())
     {
         if (!ti) continue;
-        const bool factories = ti->create && ti->base != "Component";
+        // Create() for any creatable non-component; Find/FromGuid ONLY for ResDB assets
+        // (looking a facade/singleton up by name/guid is meaningless — the same rule the
+        // C# generator uses, so both languages expose the same factories).
+        const bool creatable  = ti->create && ti->base != "Component";
+        const bool assetLookup = Reflect_IsAssetType(ti->name);
         bool any = false;
         auto ensureTable = [&] { if (!any) { lua_newtable(L); any = true; } };
         for (const Method& m : ti->methods)
@@ -594,13 +609,16 @@ static void BindReflectedStatics(lua_State* L)
             lua_pushcclosure(L, StaticFnCall, 2);     // value
             lua_rawset(L, -3);                        // subtable[fn] = closure
         }
-        if (factories)
+        if (creatable || assetLookup)
         {
             ensureTable();
-            struct { const char* name; lua_CFunction fn; } fns[] =
-                { { "Create", TypeCreate }, { "Find", TypeFind }, { "FromGuid", TypeFromGuid } };
+            struct { const char* name; lua_CFunction fn; bool on; } fns[] =
+                { { "Create", TypeCreate, creatable },
+                  { "Find", TypeFind, assetLookup },
+                  { "FromGuid", TypeFromGuid, assetLookup } };
             for (auto& e : fns)
             {
+                if (!e.on) continue;
                 lua_pushstring(L, e.name);
                 lua_pushstring(L, ti->name.c_str());  // upvalue: type name
                 lua_pushcclosure(L, e.fn, 1);
@@ -663,6 +681,21 @@ static void BindReflectedStatics(lua_State* L)
     lua_pushstring(L, "Packages");
     lua_insert(L, -2);
     lua_rawset(L, -3);
+    // Reflected ENUM tables: nuke.<EnumName>.<Label> = value (e.g. nuke.WindowMode.ExclusiveFullscreen).
+    // A [[nuke::func]] enum parameter takes the plain int, so scripts pass nuke.WindowMode.X.
+    for (const std::string& en : Reflect_AllEnumNames())
+        if (const std::vector<std::string>* labels = Reflect_EnumLabels(en))
+        {
+            lua_newtable(L);
+            for (size_t i = 0; i < labels->size(); ++i)
+            {
+                lua_pushinteger(L, (lua_Integer)i);
+                lua_setfield(L, -2, (*labels)[i].c_str());
+            }
+            lua_pushstring(L, en.c_str());
+            lua_insert(L, -2);
+            lua_rawset(L, -3);   // nuke[EnumName] = { Label = value, ... }
+        }
     lua_pop(L, 1);
 }
 
@@ -779,6 +812,12 @@ static void BindEngineAPI(lua_State* L)
             .beginClass<Atom>("Atom")
                 .addProperty("transform",
                     [](Atom* a) -> Transform* { return &a->GetTransform(); })
+                .addProperty("name",
+                    [](const Atom* a) { return a->name; },
+                    [](Atom* a, const std::string& n) { a->name = n; })
+                .addProperty("tag",
+                    [](const Atom* a) { return a->tag; },
+                    [](Atom* a, const std::string& t) { a->tag = t; })
                 // Reflection-driven component access (0.8): NO per-class bindings — any
                 // reflected component (engine or plugin) works by its type name.
                 //   local light = self:getComponent("Light")
@@ -793,6 +832,12 @@ static void BindEngineAPI(lua_State* L)
                         Component* c = Reflect_AddComponent(a, type ? type : "");
                         return c ? MakeComponentRef(L, a, c) : lb::LuaRef(L);
                     })
+                // Everything else dispatches through the reflection registry: the
+                // [[nuke::func]] Atom API (GetName/SetName, GetParent/SetParent, AddChild,
+                // Destroy, ...) — one fallback, zero per-method glue (same as Transform).
+                .addIndexMetaMethod(+[](Atom& a, const lb::LuaRef& key, lua_State* LL) {
+                    return ReflectedIndex(&a, &TypeOf<Atom>(), key, LL);
+                })
             .endClass()
             // LEGACY aliases (older scripts): the reflected surface is nuke.Time.Elapsed()/Delta().
             .addFunction("time",  [] { return Time::Elapsed(); })
