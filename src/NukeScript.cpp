@@ -584,7 +584,7 @@ static int StaticFnCall(lua_State* L)
 // Walk the reflection registry and expose every [[nuke::func]] STATIC method as
 // nuke.<Type>.<Fn> — facades (Physics, ...) become scriptable with zero hand-written glue.
 // Every creatable NON-component type additionally gets the object factories
-// Create()/Find(name)/FromGuid(guid) (components go through atom:addComponent instead).
+// Create()/Find(name)/FromGuid(guid) (components atom through atom:addComponent instead).
 static void BindReflectedStatics(lua_State* L)
 {
     lua_getglobal(L, "nuke");
@@ -928,7 +928,7 @@ public:
         if (!EnsureLoaded()) return;
         lb::LuaRef fu = (*table)["fixedUpdate"];
         if (!fu.isFunction()) return;
-        World* w = AppInstance::GetSingleton()->currentScene;
+        World* w = AppInstance::GetSingleton()->currentWorld;
         double dt = (w && w->settings.fixedDt > 0.0001f) ? w->settings.fixedDt : 1.0 / 60.0;
         try { fu(atom, dt); }
         catch (const lb::LuaException& e)
@@ -953,7 +953,7 @@ public:
     std::vector<DynProp> DynamicProps() override
     {
         std::vector<DynProp> out;
-        World* w = AppInstance::GetSingleton()->currentScene;
+        World* w = AppInstance::GetSingleton()->currentWorld;
         struct Guard { World* w; ~Guard() { if (w) w->UnlockGame(); } } guard{ w };
         if (w) w->LockGame();
         if (!EnsureLoaded() || !propsTable || propsTable->isNil())
@@ -973,7 +973,7 @@ public:
 
     void SetDynamicProp(const std::string& name, const NukeVar& v) override
     {
-        World* w = AppInstance::GetSingleton()->currentScene;
+        World* w = AppInstance::GetSingleton()->currentWorld;
         struct Guard { World* w; ~Guard() { if (w) w->UnlockGame(); } } guard{ w };
         if (w) w->LockGame();
         if (!EnsureLoaded() || !propsTable) return;
