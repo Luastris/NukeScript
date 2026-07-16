@@ -11,6 +11,23 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 set(NUKE_ROOT       "${CMAKE_CURRENT_SOURCE_DIR}/..")
 set(VCPKG_INSTALLED "$ENV{VCPKG_ROOT}/installed/x64-windows")   # VCPKG_ROOT env var, not a hardcoded path
 
+# nukegen (modular reflection): scan THIS module's sources for NUKE_CLASS + [[nuke::prop/func]] and
+# generate an in-TU .inc that registers the module's components into the engine registry — same
+# mechanism as the core, so no hand-written MakeField. NukeScript.cpp #includes the .inc + calls the
+# generated NukeReflectInit_NukeScript() from OnLoad. Regenerated whenever the source changes.
+find_program(NUKE_PYTHON NAMES python python3 REQUIRED)
+set(NUKESCRIPT_GEN "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeScript.gen.inc")
+add_custom_command(
+    OUTPUT  "${NUKESCRIPT_GEN}"
+    COMMAND "${NUKE_PYTHON}" "${NUKE_ROOT}/NukeUtils/nukegen.py"
+            --include NukeScript/src --out NukeScript/src/NukeScript.gen.inc
+            --init NukeReflectInit_NukeScript --scan-cpp --no-includes
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeScript.cpp" "${NUKE_ROOT}/NukeUtils/nukegen.py"
+    WORKING_DIRECTORY "${NUKE_ROOT}"
+    COMMENT "nukegen: NukeScript modular reflection"
+    VERBATIM)
+add_custom_target(NukeScriptGen DEPENDS "${NUKESCRIPT_GEN}")
+
 # Lua is VENDORED STATICALLY (its C sources compiled in) — like imgui in NukeGUI. No lua.dll; a clean
 # build needs nothing extra. NOT defining LUA_BUILD_AS_DLL keeps lua's symbols internal to NukeScript.dll.
 file(GLOB NUKESCRIPT_LUA_SRC "${CMAKE_CURRENT_SOURCE_DIR}/deps/lua/*.c")
@@ -19,6 +36,7 @@ add_library(NukeScript SHARED
     src/NukeScript.cpp
     ${NUKESCRIPT_LUA_SRC}
 )
+add_dependencies(NukeScript NukeScriptGen)   # generate the reflection .inc before compiling
 
 # Consumer of the engine DLL: NUKEENGINE_API symbols are dllimport, link NukeEngine.lib.
 target_compile_definitions(NukeScript PRIVATE

@@ -257,6 +257,7 @@ static int CompIndex(lua_State* L)
     if (strcmp(key, "valid") == 0) { lua_pushboolean(L, c != nullptr); return 1; }
     if (!c) { lua_pushnil(L); return 1; }               // dead handle: reads yield nil
     if (strcmp(key, "enabled") == 0) { lua_pushboolean(L, c->enabled); return 1; }
+    if (strcmp(key, "tickEvery") == 0) { lua_pushinteger(L, c->tickEvery); return 1; }   // tick interval (6.8)
     if (strcmp(key, "type") == 0)
     {
         lua_pushstring(L, c->GetType() ? c->GetType()->name.c_str() : c->name);
@@ -298,6 +299,7 @@ static int CompNewIndex(lua_State* L)
     const char* key = luaL_checkstring(L, 2);
     if (!c) return luaL_error(L, "nuke.Component: component no longer exists (stale handle)");
     if (strcmp(key, "enabled") == 0) { c->enabled = lua_toboolean(L, 3) != 0; return 0; }
+    if (strcmp(key, "tickEvery") == 0) { int v = (int)lua_tointeger(L, 3); c->tickEvery = v < 1 ? 1 : v; return 0; }   // (6.8)
     const Field* f = Reflect_FindField(c->GetType(), key);
     if (!f) f = AssetAliasField(c->GetType(), key);      // `mr.mesh = obj` writes meshGuid
     if (!f)
@@ -892,8 +894,8 @@ class ScriptComponent : public Component
 {
     NUKE_CLASS(ScriptComponent, Component)
 public:
-    [[nuke::prop]] std::string script;   // path to a .lua file (returns { props=, update= })
-    [[nuke::prop]] std::string props;    // edited prop values as JSON (hidden; serialized)
+    [[nuke::prop(asset="script")]] std::string script;   // path to a .lua file (asset picker)
+    [[nuke::prop(hidden)]]         std::string props;    // edited prop values as JSON (serialized, drawn by OnInspector)
 
     ScriptComponent() : Component("ScriptComponent"), script("scripts/bob.lua") {}
 
@@ -907,7 +909,8 @@ public:
     void Update() override
     {
         if (!EnsureLoaded()) return;
-        double dt = Time::getSingleton()->delta;
+        // Scaled GAME delta (Game.SetTimeScale, 6.1): 0 while frozen, ×2/×3 at fast-forward.
+        double dt = Time::getSingleton()->gameDelta;
         lb::LuaRef upd = (*table)["update"];
         if (upd.isFunction())
         {
@@ -1012,6 +1015,62 @@ public:
             try { h(atom, std::string(name ? name : "")); }
             catch (const lb::LuaException& e) { cerr << "[NukeScript]\tanimEvent error: " << e.what() << endl; Clear(); }
         }
+    }
+
+    // Event bus (6.3): every queued nuke.Events event, delivered from World::Update under
+    // the game lock — enter the VM directly: onEvent(self, name, payload). Filter by name
+    // in the script; scripts without the function pay one table lookup.
+    void OnEvent(const std::string& name, const std::string& payload) override
+    {
+        if (!EnsureLoaded()) return;
+        lb::LuaRef h = (*table)["onEvent"];
+        if (h.isFunction())
+        {
+            try { h(atom, name, payload); }
+            catch (const lb::LuaException& e) { cerr << "[NukeScript]\tonEvent error: " << e.what() << endl; Clear(); }
+        }
+    }
+
+    // Savegame v2 (6.6): capture the LIVE exported props at save time. The script picks
+    // the policy via table fields: `saveMode` = "all" (default — the whole live props
+    // table) | "none" (keep the configured values) | "marked" (+ `saveFields = {"hp",...}`
+    // — only those keys, merged over the configured props). A script that never loaded
+    // keeps its serialized props untouched (no VM entry during a plain editor save).
+    void OnBeforeSave() override
+    {
+        if (!table || !propsTable) return;
+        try
+        {
+            lb::LuaRef m = (*table)["saveMode"];
+            const std::string mode = m.isString() ? *m.cast<std::string>() : std::string("all");
+            if (mode == "none") return;
+            if (mode == "marked")
+            {
+                lb::LuaRef list = (*table)["saveFields"];
+                if (!list.isTable()) return;
+                json cur = props.empty() ? json::object() : json::parse(props, nullptr, false);
+                if (!cur.is_object()) cur = json::object();
+                for (int i = 1; ; ++i)
+                {
+                    lb::LuaRef k = list[i];
+                    if (k.isNil()) break;
+                    if (!k.isString()) continue;
+                    const std::string key = *k.cast<std::string>();
+                    lb::LuaRef v = (*propsTable)[key];
+                    switch (v.type())
+                    {
+                        case LUA_TNUMBER:  cur[key] = *v.cast<double>(); break;
+                        case LUA_TBOOLEAN: cur[key] = *v.cast<bool>(); break;
+                        case LUA_TSTRING:  cur[key] = *v.cast<std::string>(); break;
+                        default: break;
+                    }
+                }
+                props = cur.dump();
+                return;
+            }
+            EncodeProps();   // "all": the whole live props table
+        }
+        catch (const lb::LuaException& e) { cerr << "[NukeScript]\tOnBeforeSave error: " << e.what() << endl; }
     }
 
     void Pause() override       {}
@@ -1144,24 +1203,11 @@ private:
     }
 };
 
-// Register ScriptComponent at DLL-LOAD time. This static initializer runs synchronously
-// when InitModules loads the module (before Run is spawned on a worker thread), so a world
-// deserialized right after InitModules already knows the type — no registration race.
-static bool RegisterScriptComponent()
-{
-    TypeInfo& t = TypeOf<ScriptComponent>();
-    t.base = "Component";
-    if (t.fields.empty())
-    {
-        t.fields.push_back(MakeField("script", &ScriptComponent::script, "script"));   // asset picker (.lua)
-        Field pf = MakeField("props", &ScriptComponent::props);
-        pf.hidden = true;   // serialized, but drawn by OnInspector instead of the raw JSON
-        t.fields.push_back(pf);
-    }
-    t.create = []() -> void* { return new ScriptComponent(); };
-    cout << "[NukeScript]\tScriptComponent registered." << endl;
-    return true;
-}
+// Modular reflection: nukegen scans THIS file's [[nuke::prop]]-tagged components and emits the
+// registration into NukeScript.gen.inc (in-TU — the class is defined above, member pointers resolve).
+// Registers into the engine's shared registry, so a world deserialized right after InitModules knows
+// the type. Called synchronously from OnLoad (before Run spawns), so there's no registration race.
+#include "NukeScript.gen.inc"   // defines NukeReflectInit_NukeScript()
 
 // ----------------------------------------------------------------------------
 // Plugin
@@ -1241,7 +1287,8 @@ struct NukeScriptModule : public NUKEModule
     // exists while the plugin is enabled — disabled, its components stay inert placeholders.
     void OnLoad() override
     {
-        RegisterScriptComponent();
+        NukeReflectInit_NukeScript();   // register this module's reflected components (generated)
+        cout << "[NukeScript]\tScriptComponent registered." << endl;
         // Full file-type descriptor for .lua (the editor does the actual file IO — no boost
         // here): New-menu entry under "Scripts", text-editable, "lua" syntax highlighting.
         nuke::AssetCreator luaType;
