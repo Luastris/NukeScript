@@ -852,6 +852,16 @@ static void BindEngineAPI(lua_State* L)
                     for (const std::string& n : Reflect_ComponentTypes()) t[i++] = n;
                     return t;
                 })
+            // Empty ATOM REFERENCE for a script prop default: `props = { target = nuke.AtomRef() }`.
+            // The inspector draws the atom PICKER for it; once assigned (picker / drag-drop /
+            // load) the prop VALUE is the live Atom itself — `P.target.transform` just works.
+            // Unset/dead refs read as this sentinel table (no .transform -> falsy checks work).
+            .addFunction("AtomRef",
+                [](lua_State* L) -> lb::LuaRef {
+                    lb::LuaRef t = lb::newTable(L);
+                    t["__atomref"] = 0;
+                    return t;
+                })
         .endNamespace()
         // LEGACY alias namespace (older scripts + the template use gui.begin/done); the
         // reflected surface is nuke.Gui.* (auto-bound from [[nuke::func]] statics).
@@ -909,6 +919,8 @@ public:
     void Update() override
     {
         if (!EnsureLoaded()) return;
+        RunStartOnce();
+        if (!table) return;   // start error tore the chunk down
         // Scaled GAME delta (Game.SetTimeScale, 6.1): 0 while frozen, ×2/×3 at fast-forward.
         double dt = Time::getSingleton()->gameDelta;
         lb::LuaRef upd = (*table)["update"];
@@ -929,6 +941,8 @@ public:
     void FixedUpdate() override
     {
         if (!EnsureLoaded()) return;
+        RunStartOnce();   // whichever cadence reaches the fresh chunk first fires it
+        if (!table) return;
         lb::LuaRef fu = (*table)["fixedUpdate"];
         if (!fu.isFunction()) return;
         World* w = AppInstance::GetSingleton()->currentWorld;
@@ -982,9 +996,10 @@ public:
         if (!EnsureLoaded() || !propsTable) return;
         switch (v.kind)
         {
-            case NukeVar::Kind::Number: (*propsTable)[name] = v.num; break;
-            case NukeVar::Kind::Bool:   (*propsTable)[name] = v.b;   break;
-            case NukeVar::Kind::String: (*propsTable)[name] = v.str; break;
+            case NukeVar::Kind::Number:  (*propsTable)[name] = v.num; break;
+            case NukeVar::Kind::Bool:    (*propsTable)[name] = v.b;   break;
+            case NukeVar::Kind::String:  (*propsTable)[name] = v.str; break;
+            case NukeVar::Kind::AtomRef: SetAtomRefProp(name, v.refId); break;   // live atom into the table
             default: break;
         }
         EncodeProps();
@@ -1079,6 +1094,7 @@ public:
 private:
     lb::LuaRef* table = nullptr;        // chunk's returned table
     lb::LuaRef* propsTable = nullptr;   // table["props"] (the exported props)
+    bool started = false;               // `start` hook fired for the current chunk
     std::string loadedScript;           // path the current chunk came from (for reload-on-change)
     std::string defaultsJson;           // script's original prop defaults (for the reset button)
 
@@ -1095,10 +1111,28 @@ private:
         }
     }
 
+    // One-shot `start(self)` hook: fires once per LOADED CHUNK, before the first
+    // update/fixedUpdate. Clear() resets it, so a script reload (edit, PIE restart)
+    // runs start again — same lifecycle as the C# Electron.Start.
+    void RunStartOnce()
+    {
+        if (started || !table) return;
+        started = true;
+        lb::LuaRef st = (*table)["start"];
+        if (!st.isFunction()) return;
+        try { st(atom); }
+        catch (const lb::LuaException& e)
+        {
+            cerr << "[NukeScript]\tstart error: " << e.what() << endl;
+            Clear();
+        }
+    }
+
     void Clear()
     {
         delete table;      table = nullptr;
         delete propsTable; propsTable = nullptr;
+        started = false;
     }
 
     // Load (or reload) the chunk; returns true if a valid table is ready.
@@ -1141,6 +1175,24 @@ private:
         return true;
     }
 
+    // Atom-ref prop values: a live Atom PROXY in the table (assigned), or the sentinel
+    // `{ __atomref = <id> }` (empty / not-yet-resolved — the id survives resaves).
+    // Returns -1 when the value is NOT an atom ref at all.
+    static long long AtomRefId(const lb::LuaRef& val)
+    {
+        if (val.isUserdata() && val.isInstance<Atom>())
+        {
+            auto a = val.cast<Atom*>();
+            return (a && *a) ? (long long)Reflect_AtomId(*a) : 0;
+        }
+        if (val.isTable() && !val["__atomref"].isNil())
+        {
+            lb::LuaRef id = val["__atomref"];
+            return id.isNumber() ? (long long)*id.cast<double>() : 0;
+        }
+        return -1;
+    }
+
     static json TableToJson(lb::LuaRef* t)
     {
         json j = json::object();
@@ -1149,6 +1201,8 @@ private:
         {
             std::string key = it.key().tostring();
             lb::LuaRef val = it.value();
+            const long long ref = AtomRefId(val);
+            if (ref >= 0) { j[key] = { { "__atomref", ref } }; continue; }   // by STABLE id
             switch (val.type())
             {
                 case LUA_TNUMBER:  j[key] = *val.cast<double>(); break;
@@ -1163,6 +1217,8 @@ private:
     static NukeVar ToVar(lb::LuaRef val)
     {
         NukeVar nv;
+        const long long ref = AtomRefId(val);
+        if (ref >= 0) { nv.kind = NukeVar::Kind::AtomRef; nv.refId = ref; return nv; }
         switch (val.type())
         {
             case LUA_TNUMBER:  nv.kind = NukeVar::Kind::Number; nv.num = *val.cast<double>(); break;
@@ -1176,16 +1232,38 @@ private:
     static NukeVar JsonToVar(const json& v)
     {
         NukeVar nv;
-        if (v.is_number())       { nv.kind = NukeVar::Kind::Number; nv.num = v.get<double>(); }
+        if (v.is_object() && v.contains("__atomref"))
+        {
+            nv.kind = NukeVar::Kind::AtomRef;
+            nv.refId = v["__atomref"].is_number() ? v["__atomref"].get<long long>() : 0;
+        }
+        else if (v.is_number())  { nv.kind = NukeVar::Kind::Number; nv.num = v.get<double>(); }
         else if (v.is_boolean()) { nv.kind = NukeVar::Kind::Bool;   nv.b   = v.get<bool>(); }
         else if (v.is_string())  { nv.kind = NukeVar::Kind::String; nv.str = v.get<std::string>(); }
         return nv;
     }
 
+    // Store an atom-ref value into the props table: the LIVE atom when it resolves (the
+    // script then uses it directly), else the sentinel keeping the id for later.
+    void SetAtomRefProp(const std::string& key, long long id)
+    {
+        World* w = AppInstance::GetSingleton()->currentWorld;
+        Atom* a = (id != 0 && w) ? w->GetById((long)id) : nullptr;
+        if (a) (*propsTable)[key] = a;
+        else
+        {
+            lb::LuaRef t = lb::newTable(gL);
+            t["__atomref"] = (double)id;
+            (*propsTable)[key] = t;
+        }
+    }
+
     void SetProp(const std::string& key, const json& v)
     {
         if (!propsTable) return;
-        if (v.is_number())       (*propsTable)[key] = v.get<double>();
+        if (v.is_object() && v.contains("__atomref"))
+            SetAtomRefProp(key, v["__atomref"].is_number() ? v["__atomref"].get<long long>() : 0);
+        else if (v.is_number())  (*propsTable)[key] = v.get<double>();
         else if (v.is_boolean()) (*propsTable)[key] = v.get<bool>();
         else if (v.is_string())  (*propsTable)[key] = v.get<std::string>();
     }
