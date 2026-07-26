@@ -269,6 +269,24 @@ static int CompIndex(lua_State* L)
         return 1;
     }
     const Field* f = Reflect_FindField(c->GetType(), key);
+    if (f && (f->type == FT::IntList || f->type == FT::FloatList || f->type == FT::DoubleList || f->type == FT::StringList))
+    {
+        // LIST prop -> a plain Lua array table (values via the JSON bridge; ReflectValue
+        // cannot carry vectors).
+        nlohmann::json j = nlohmann::json::parse(Reflect_GetFieldJson(c, *f), nullptr, false);
+        lua_newtable(L);
+        if (j.is_array())
+        {
+            int i = 1;
+            for (auto& e : j)
+            {
+                if (e.is_string()) lua_pushstring(L, e.get<std::string>().c_str());
+                else               lua_pushnumber(L, e.is_number() ? e.get<double>() : 0.0);
+                lua_rawseti(L, -2, i++);
+            }
+        }
+        return 1;
+    }
     if (f) return PushReflectValue(L, Reflect_GetField(c, *f));
     if (Reflect_FindMethod(c->GetType(), key))           // [[nuke::func]] method -> bound closure
     {
@@ -305,6 +323,28 @@ static int CompNewIndex(lua_State* L)
     if (!f)
         return luaL_error(L, "nuke.Component: '%s' has no property '%s'",
                           c->GetType() ? c->GetType()->name.c_str() : c->name, key);
+    // LIST prop (curves, id lists, ...): a Lua array table replaces the whole vector — the
+    // values travel through the same JSON encoding the serializer uses.
+    if (f->type == FT::IntList || f->type == FT::FloatList || f->type == FT::DoubleList || f->type == FT::StringList)
+    {
+        if (!lua_istable(L, 3))
+            return luaL_error(L, "nuke.Component: '%s.%s' is a list — assign an array table",
+                              c->GetType() ? c->GetType()->name.c_str() : c->name, key);
+        nlohmann::json j = nlohmann::json::array();
+        const int n = (int)lua_rawlen(L, 3);
+        for (int i = 1; i <= n; ++i)
+        {
+            lua_rawgeti(L, 3, i);
+            if (f->type == FT::StringList) { const char* s = lua_tostring(L, -1); j.push_back(s ? s : ""); }
+            else                           j.push_back(lua_tonumber(L, -1));
+            lua_pop(L, 1);
+        }
+        if (!Reflect_SetFieldJson(c, *f, j.dump()))
+            return luaL_error(L, "nuke.Component: bad list value for '%s.%s'",
+                              c->GetType() ? c->GetType()->name.c_str() : c->name, key);
+        Reflect_ComponentFieldChanged(c, *f);
+        return 0;
+    }
     ReflectValue v;
     if (!f->asset.empty() && lua_isnil(L, 3))            // nil clears an asset reference
     {
