@@ -902,7 +902,7 @@ static std::string ReadFile(const std::string& path)
 // ----------------------------------------------------------------------------
 class ScriptComponent : public Component
 {
-    NUKE_CLASS(ScriptComponent, Component)
+    NUKE_CLASS(ScriptComponent, Component, "Scripts")
 public:
     [[nuke::prop(asset="script")]] std::string script;   // path to a .lua file (asset picker)
     [[nuke::prop(hidden)]]         std::string props;    // edited prop values as JSON (serialized, drawn by OnInspector)

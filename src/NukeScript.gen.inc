@@ -10,6 +10,7 @@ bool NukeReflectInit_NukeScript() {
 	{
 		TypeInfo& t = TypeOf<ScriptComponent>();
 		t.base = "Component";
+		t.category = "Scripts";
 		t.fields.push_back(MakeField("script", &ScriptComponent::script, "script"));
 		t.fields.push_back(MakeField("props", &ScriptComponent::props));
 		t.fields.back().hidden = true;
