@@ -1,17 +1,9 @@
-// NukeScript — a gameplay plugin that adds a Lua-backed ScriptComponent.
+// NukeScript — a gameplay plugin that adds a Lua-backed ScriptComponent, registered into
+// the engine's shared reflection registry at load.
 //
-// Registered into the engine's shared reflection registry at load, so it is serializable,
-// create-by-name, and shows in the auto-inspector — yet only exists when this module loads.
-//
-// Script convention: the .lua file (path in the `script` field) returns a table:
-//     local props = { speed = 2.0, height = 1.0 }   -- exported, editable in the inspector
-//     return {
-//       props  = props,                              -- inspector reads/writes this table
-//       update = function(self, dt) ... use props ... end
-//     }
-// `props` is captured by the update closure AND exposed on the table, so inspector edits
-// are seen live by the script (same table by reference). Edited values persist via the
-// hidden, serialized `props` JSON field.
+// Script convention: the .lua file returns { props = {...}, update = function(self, dt) end }.
+// `props` is shared BY REFERENCE with the inspector (edits are seen live) and persisted in
+// the hidden serialized `props` JSON field.
 
 #include <interface/NUKEEInteface.h>   // NUKEModule + AppInstance
 #include <interface/AssetCreators.h>   // register a "New Lua Script" browser command (data only)
@@ -41,30 +33,17 @@ using namespace nuke;
 namespace lb = luabridge;
 using json = nlohmann::json;
 
-// ----------------------------------------------------------------------------
-// One Lua VM, created lazily on the thread that first runs/inspects a script
-// (the main/update thread), never on the loader thread.
-// ----------------------------------------------------------------------------
+// The one Lua VM, created lazily on the thread that first runs a script — never the loader thread.
 static lua_State* gL = nullptr;
 
-// ----------------------------------------------------------------------------
-// Generic component proxy (reflection-driven, roadmap 0.8). NO per-class wrappers:
-// a component is a tiny userdata handle {atomId, componentId}; __index/__newindex
-// resolve the live component through the engine's ReflectBind layer and access its
-// [[nuke::prop]] fields by name via Field::addr + FT. Handles are STALE-SAFE — after
-// a world reload / component removal, reads yield nil and writes raise a Lua error
-// instead of touching freed memory.
-//
-// Value mapping: Bool <-> boolean, Int/Float/Double <-> number, String <-> string,
-// Vec3 <-> nuke.Vector3 (or a {x,y,z} table on write), Vec2/Vec4/Quat <-> {x,y,z,w}
-// table, Color <-> {r,g,b,a} table. Built-in keys: valid, enabled, type, atom.
-// ----------------------------------------------------------------------------
+// Reflection-driven component proxy: a userdata {atomId, componentId} resolved through
+// ReflectBind. Stale-safe — reads on a dead handle yield nil, writes raise a Lua error.
+// Values map as Vec3<->nuke.Vector3, Vec2/Vec4/Quat<->{x,y,z,w}, Color<->{r,g,b,a}.
 struct CompRef { unsigned long atomId; unsigned long compId; };
 static const char* kCompMeta = "nuke.Component";
 
-// Reflected OBJECT handles (task #67, defined below the component proxy): every reflected
-// Model class is first-class in Lua too — create/find/edit/assign, never a guid in user
-// code. Forward pieces the component proxy uses to expose asset-ref fields as objects.
+// Reflected OBJECT handles (defined below): forward pieces the component proxy uses to
+// expose asset-reference fields as objects rather than guids.
 struct ObjRef { unsigned long id; };
 static const char* kObjMeta = "nuke.Object";
 static int PushObjHandle(lua_State* L, unsigned long id);
@@ -216,9 +195,8 @@ static bool ReadReflectValue(lua_State* L, int idx, FT ft, const ReflectValue& c
     }
 }
 
-// Bound method call: `comp:Method(args...)`. The closure carries (atomId, compId,
-// methodName) — ids + name, never pointers, so a stale call errors instead of crashing,
-// and re-registration (plugin re-enable) can't leave a dangling Method*.
+// Bound method call `comp:Method(args...)`. Upvalues are (atomId, compId, methodName) —
+// ids and a name, never pointers, so a stale call errors instead of crashing.
 static int CompMethodCall(lua_State* L)
 {
     unsigned long atomId = (unsigned long)lua_tointeger(L, lua_upvalueindex(1));
@@ -229,8 +207,7 @@ static int CompMethodCall(lua_State* L)
     const Method* m = Reflect_FindMethod(c->GetType(), mname);
     if (!m) return luaL_error(L, "nuke.Component: method '%s' vanished (plugin toggled?)", mname);
 
-    // Colon call puts the component handle at slot 1 — args follow. Dot-call without the
-    // handle also works: args then start at 1.
+    // Colon call puts the handle at slot 1 and args after it; a dot-call starts args at 1.
     const int base = luaL_testudata(L, 1, kCompMeta) ? 2 : 1;
     const size_t nargs = m->params.size();
     if ((size_t)(lua_gettop(L) - base + 1) < nargs)
@@ -271,8 +248,7 @@ static int CompIndex(lua_State* L)
     const Field* f = Reflect_FindField(c->GetType(), key);
     if (f && (f->type == FT::IntList || f->type == FT::FloatList || f->type == FT::DoubleList || f->type == FT::StringList))
     {
-        // LIST prop -> a plain Lua array table (values via the JSON bridge; ReflectValue
-        // cannot carry vectors).
+        // LIST prop -> a plain Lua array table, via the JSON bridge (ReflectValue holds no vectors).
         nlohmann::json j = nlohmann::json::parse(Reflect_GetFieldJson(c, *f), nullptr, false);
         lua_newtable(L);
         if (j.is_array())
@@ -297,8 +273,7 @@ static int CompIndex(lua_State* L)
         lua_pushcclosure(L, CompMethodCall, 3);
         return 1;
     }
-    // OBJECT view of an asset-reference field: `mr.mesh` (field meshGuid) yields a live
-    // object handle; the raw `mr.meshGuid` string stays available for tooling.
+    // OBJECT view of an asset-reference field: `mr.mesh` (field meshGuid) -> object handle.
     if (const Field* af = AssetAliasField(c->GetType(), key))
         return PushObjHandle(L, Reflect_ObjectFromGuid(Reflect_GetField(c, *af).str));
     // A component-OWNED object: `mr.material` -> its live material instance.
@@ -323,8 +298,7 @@ static int CompNewIndex(lua_State* L)
     if (!f)
         return luaL_error(L, "nuke.Component: '%s' has no property '%s'",
                           c->GetType() ? c->GetType()->name.c_str() : c->name, key);
-    // LIST prop (curves, id lists, ...): a Lua array table replaces the whole vector — the
-    // values travel through the same JSON encoding the serializer uses.
+    // LIST prop: a Lua array table replaces the whole vector, via the serializer's JSON encoding.
     if (f->type == FT::IntList || f->type == FT::FloatList || f->type == FT::DoubleList || f->type == FT::StringList)
     {
         if (!lua_istable(L, 3))
@@ -376,8 +350,8 @@ static void RegisterComponentProxy(lua_State* L)
     lua_pop(L, 1);
 }
 
-// Wrap a live component into a stale-safe handle (ids, not pointers). `atom` is the
-// owner we found/created it on — Component::atom may lag Init, the caller knows better.
+// Wrap a live component into a stale-safe handle (ids, not pointers). Pass the owning
+// `atom` explicitly: Component::atom may still be unset before Init.
 static lb::LuaRef MakeComponentRef(lua_State* L, Atom* atom, Component* c)
 {
     CompRef* r = (CompRef*)lua_newuserdata(L, sizeof(CompRef));
@@ -389,13 +363,9 @@ static lb::LuaRef MakeComponentRef(lua_State* L, Atom* atom, Component* c)
     return ref;
 }
 
-// ----------------------------------------------------------------------------
-// Reflected OBJECT handles (task #67). A nuke.Object userdata carries only an engine
-// handle id (ReflectBind's ObjTable) — the same table C# rides on, so both languages see
-// the same objects. __index/__newindex dispatch fields + [[nuke::func]] methods through
-// the registry; asset-reference fields read/write as OBJECTS (never guids in user code).
-// Builtins: valid, guid, type; Texture adds setPixels(w, h, rgbaString).
-// ----------------------------------------------------------------------------
+// Reflected OBJECT handles: a nuke.Object userdata carries only a ReflectBind ObjTable id
+// (the same table C# uses). __index/__newindex dispatch fields and [[nuke::func]] methods
+// through the registry. Builtins: valid, guid, type; Texture adds setPixels(w, h, rgba).
 static int PushObjHandle(lua_State* L, unsigned long id)
 {
     if (!id) { lua_pushnil(L); return 1; }
@@ -453,9 +423,7 @@ static int ObjSetPixels(lua_State* L)
     return 1;
 }
 
-// Mesh CONTENT: mesh:setGeometry(verts [, normals [, uvs]]) — flat number arrays, an
-// unindexed TRIANGLE LIST (verts = 9*T numbers; normals same length, optional -> flat
-// per-triangle computed; uvs = 2 per vertex, optional -> zeros).
+// Read a flat Lua number array into `out`; false if the value is not a numeric table.
 static bool ReadFloatArray(lua_State* L, int idx, std::vector<float>& out)
 {
     if (!lua_istable(L, idx)) return false;
@@ -471,6 +439,8 @@ static bool ReadFloatArray(lua_State* L, int idx, std::vector<float>& out)
     return true;
 }
 
+// mesh:setGeometry(verts [, normals [, uvs]]) — unindexed triangle list, verts = 9*T numbers,
+// normals match verts (else computed flat), uvs 2 per vertex (else zeros).
 static int ObjSetGeometry(lua_State* L)
 {
     ObjRef* r = (ObjRef*)luaL_checkudata(L, 1, kObjMeta);
@@ -595,9 +565,8 @@ static int TypeFromGuid(lua_State* L)
     return PushObjHandle(L, id);
 }
 
-// Bound STATIC reflected function: nuke.<Type>.<Fn>(args...). Upvalues carry (typeName,
-// fnName) strings — resolved through the registry per call, so plugin re-registration
-// can never dangle. Fully reflection-driven: no per-facade wrappers anywhere.
+// Bound static reflected function nuke.<Type>.<Fn>(args...). Upvalues are (typeName, fnName)
+// strings, resolved through the registry per call so re-registration can never dangle.
 static int StaticFnCall(lua_State* L)
 {
     const char* tname = lua_tostring(L, lua_upvalueindex(1));
@@ -623,10 +592,8 @@ static int StaticFnCall(lua_State* L)
     return PushReflectValue(L, ret);
 }
 
-// Walk the reflection registry and expose every [[nuke::func]] STATIC method as
-// nuke.<Type>.<Fn> — facades (Physics, ...) become scriptable with zero hand-written glue.
-// Every creatable NON-component type additionally gets the object factories
-// Create()/Find(name)/FromGuid(guid) (components atom through atom:addComponent instead).
+// Expose every reflected static method as nuke.<Type>.<Fn>, plus the object factories
+// Create()/Find(name)/FromGuid(guid) (components come from atom:addComponent instead).
 static void BindReflectedStatics(lua_State* L)
 {
     lua_getglobal(L, "nuke");
@@ -634,9 +601,7 @@ static void BindReflectedStatics(lua_State* L)
     for (TypeInfo* ti : Registry_All())
     {
         if (!ti) continue;
-        // Create() for any creatable non-component; Find/FromGuid ONLY for ResDB assets
-        // (looking a facade/singleton up by name/guid is meaningless — the same rule the
-        // C# generator uses, so both languages expose the same factories).
+        // Create() for creatable non-components; Find/FromGuid only for ResDB assets (same rule as the C# generator).
         const bool creatable  = ti->create && ti->base != "Component";
         const bool assetLookup = Reflect_IsAssetType(ti->name);
         bool any = false;
@@ -667,8 +632,7 @@ static void BindReflectedStatics(lua_State* L)
                 lua_rawset(L, -3);
             }
         }
-        // Sound CONTENT: nuke.Audio.PlayData(bytes [, volume [, loop [, bus]]]) — encoded
-        // audio (ogg/wav/mp3/flac) as a Lua string; a blob, so hand-bound like setPixels.
+        // nuke.Audio.PlayData(bytes [, volume [, loop [, bus]]]) — a blob, so hand-bound like setPixels.
         if (ti->name == "Audio")
         {
             ensureTable();
@@ -706,8 +670,7 @@ static void BindReflectedStatics(lua_State* L)
     lua_pushstring(L, "Assets");
     lua_insert(L, -2);
     lua_rawset(L, -3);
-    // nuke.Packages.read(rel) — content bytes through the engine's layered resolution
-    // (raw project or mounted pak), as a Lua string; nil when absent.
+    // nuke.Packages.read(rel) — content bytes as a Lua string (raw project or mounted pak); nil when absent.
     lua_newtable(L);
     lua_pushcfunction(L, +[](lua_State* LL) -> int {
         std::string data;
@@ -741,10 +704,9 @@ static void BindReflectedStatics(lua_State* L)
     lua_pop(L, 1);
 }
 
-// ---- generic reflected-OBJECT dispatch (non-component engine objects: Transform, ...) --
-// Bound method call for an object reached through a live pointer (LuaBridge class
-// userdata): upvalues = (obj lightuserdata, typeName, methodName). Same lifetime contract
-// as the pointer binding itself — the closure is produced per-access and used immediately.
+// Bound method call for an object reached through a live pointer (LuaBridge class userdata):
+// upvalues = (obj lightuserdata, typeName, methodName). The closure is made per-access and
+// used immediately — it borrows the pointer binding's lifetime, so never store it.
 static int ObjMethodCall(lua_State* L)
 {
     void* obj = lua_touserdata(L, lua_upvalueindex(1));
@@ -772,10 +734,9 @@ static int ObjMethodCall(lua_State* L)
     return PushReflectValue(L, ret);
 }
 
-// __index over the reflection registry: fields by name (FT::Vec3 comes back as a LIVE
-// Vector3* so nested writes — `t.position.y = 1` — mutate in place, exactly like the old
-// hand-written binding), [[nuke::func]] methods as bound closures. Reusable for any
-// reflected engine object exposed as a LuaBridge class.
+// __index over the reflection registry for any reflected object exposed as a LuaBridge class:
+// fields by name (FT::Vec3 as a LIVE Vector3* so `t.position.y = 1` mutates in place) and
+// [[nuke::func]] methods as bound closures.
 static lb::LuaRef ReflectedIndex(void* obj, TypeInfo* ti, const lb::LuaRef& key, lua_State* L)
 {
     if (!ti || !key.isString()) return lb::LuaRef(L);
@@ -840,9 +801,7 @@ static void BindEngineAPI(lua_State* L)
                     [](const Vector3* v) { return v->z; },
                     [](Vector3* v, double d) { v->z = d; })
             .endClass()
-            // Transform: NO hand-written members — __index/__newindex dispatch through the
-            // reflection registry ([[nuke::prop]] fields incl. live Vector3*, [[nuke::func]]
-            // methods incl. the legacy setEuler/euler aliases, which are reflected methods).
+            // Transform has no hand-written members: everything dispatches through reflection.
             .beginClass<Transform>("Transform")
                 .addIndexMetaMethod(+[](Transform& t, const lb::LuaRef& key, lua_State* LL) {
                     return ReflectedIndex(&t, &TypeOf<Transform>(), key, LL);
@@ -860,10 +819,7 @@ static void BindEngineAPI(lua_State* L)
                 .addProperty("tag",
                     [](const Atom* a) { return a->tag; },
                     [](Atom* a, const std::string& t) { a->tag = t; })
-                // Reflection-driven component access (0.8): NO per-class bindings — any
-                // reflected component (engine or plugin) works by its type name.
-                //   local light = self:getComponent("Light")
-                //   if light then light.intensity = 5 end
+                // Any reflected component works by type name: self:getComponent("Light").
                 .addFunction("getComponent",
                     [](Atom* a, const char* type, lua_State* L) -> lb::LuaRef {
                         Component* c = Reflect_FindComponent(a, type ? type : "");
@@ -874,9 +830,7 @@ static void BindEngineAPI(lua_State* L)
                         Component* c = Reflect_AddComponent(a, type ? type : "");
                         return c ? MakeComponentRef(L, a, c) : lb::LuaRef(L);
                     })
-                // Everything else dispatches through the reflection registry: the
-                // [[nuke::func]] Atom API (GetName/SetName, GetParent/SetParent, AddChild,
-                // Destroy, ...) — one fallback, zero per-method glue (same as Transform).
+                // Everything else falls back to the reflected [[nuke::func]] Atom API.
                 .addIndexMetaMethod(+[](Atom& a, const lb::LuaRef& key, lua_State* LL) {
                     return ReflectedIndex(&a, &TypeOf<Atom>(), key, LL);
                 })
@@ -892,10 +846,9 @@ static void BindEngineAPI(lua_State* L)
                     for (const std::string& n : Reflect_ComponentTypes()) t[i++] = n;
                     return t;
                 })
-            // Empty ATOM REFERENCE for a script prop default: `props = { target = nuke.AtomRef() }`.
-            // The inspector draws the atom PICKER for it; once assigned (picker / drag-drop /
-            // load) the prop VALUE is the live Atom itself — `P.target.transform` just works.
-            // Unset/dead refs read as this sentinel table (no .transform -> falsy checks work).
+            // Empty atom reference for a prop default: `props = { target = nuke.AtomRef() }`.
+            // Once assigned the prop value is the live Atom; unset/dead refs read as this
+            // sentinel table (it has no .transform, so falsy checks work).
             .addFunction("AtomRef",
                 [](lua_State* L) -> lb::LuaRef {
                     lb::LuaRef t = lb::newTable(L);
@@ -903,8 +856,7 @@ static void BindEngineAPI(lua_State* L)
                     return t;
                 })
         .endNamespace()
-        // LEGACY alias namespace (older scripts + the template use gui.begin/done); the
-        // reflected surface is nuke.Gui.* (auto-bound from [[nuke::func]] statics).
+        // Legacy alias namespace for older scripts; the reflected surface is nuke.Gui.*.
         .beginNamespace("gui")
             .addFunction("begin",     [](const char* n) { return nuke::GUI()->Begin(n); })
             .addFunction("done",      [] { nuke::GUI()->End(); })
@@ -937,9 +889,7 @@ static std::string ReadFile(const std::string& path)
     return ss.str();
 }
 
-// ----------------------------------------------------------------------------
-// ScriptComponent
-// ----------------------------------------------------------------------------
+// Lua-backed component: loads the script table and drives its update/gui/event hooks.
 class ScriptComponent : public Component
 {
     NUKE_CLASS(ScriptComponent, Component, "Scripts")
@@ -961,8 +911,7 @@ public:
         if (!EnsureLoaded()) return;
         RunStartOnce();
         if (!table) return;   // start error tore the chunk down
-        // Scaled GAME delta (Game.SetTimeScale, 6.1): 0 while frozen, ×2/×3 at fast-forward.
-        double dt = Time::getSingleton()->gameDelta;
+        double dt = Time::getSingleton()->gameDelta;   // scaled game delta: 0 while frozen
         lb::LuaRef upd = (*table)["update"];
         if (upd.isFunction())
         {
@@ -975,9 +924,8 @@ public:
         }
     }
 
-    // Fixed-rate script hook: `fixedUpdate(self, dt)` at the world's fixedDt cadence.
-    // Called by World's FIXED THREAD under the game lock — the same lock every other VM
-    // entry (Update, OnGUI, contact hooks) holds, so the shared VM is cross-thread safe.
+    // Calls the script's `fixedUpdate(self, dt)` at the world's fixedDt cadence. Runs on the
+    // fixed thread under the game lock — the lock every VM entry takes, keeping the VM safe.
     void FixedUpdate() override
     {
         if (!EnsureLoaded()) return;
@@ -995,18 +943,15 @@ public:
         }
     }
 
-    // ---- physics contact hooks -------------------------------------------------------
-    // Dispatched by the FIXED THREAD under the game lock -> the VM is safe to enter
-    // DIRECTLY (no queueing, no frame delay). Script hooks:
-    // onCollisionEnter/onCollisionExit/onTriggerEnter/onTriggerExit(self, other).
+    // Contact hooks -> script's onCollision*/onTrigger*(self, other). Dispatched by the
+    // fixed thread under the game lock, so the VM is entered directly.
     void OnCollisionEnter(Atom* other) override { CallContactHook("onCollisionEnter", other); }
     void OnCollisionExit(Atom* other) override  { CallContactHook("onCollisionExit", other); }
     void OnTriggerEnter(Atom* other) override   { CallContactHook("onTriggerEnter", other); }
     void OnTriggerExit(Atom* other) override    { CallContactHook("onTriggerExit", other); }
 
-    // DATA only — expose the script's exported props (the editor renders + edits them).
-    // Runs on the editor's render thread: take the game lock — the fixed thread may be
-    // inside this same VM (fixedUpdate/contact hooks).
+    // Returns the script's exported props for the editor. Runs on the render thread, so it
+    // takes the game lock: the fixed thread may be inside this same VM.
     std::vector<DynProp> DynamicProps() override
     {
         std::vector<DynProp> out;
@@ -1046,8 +991,7 @@ public:
     }
 
     void Destroy() override     { Clear(); }
-    // Runtime UI: call the script's gui(self) each frame (NukeGUI dispatches this). Same VM/thread as
-    // Update in the editor (single-threaded play), so no extra locking.
+    // Calls the script's gui(self); same thread as Update, so no extra locking.
     void OnGUI() override
     {
         if (!EnsureLoaded()) return;
@@ -1059,8 +1003,7 @@ public:
         }
     }
 
-    // Animation event from the sibling Animator (3.1). Game thread with the game lock
-    // held (same contract as OnGUI) — enter the VM directly: animEvent(self, name).
+    // Animator event -> script's animEvent(self, name); game thread under the game lock.
     void OnAnimEvent(const char* name) override
     {
         if (!EnsureLoaded()) return;
@@ -1072,9 +1015,8 @@ public:
         }
     }
 
-    // Event bus (6.3): every queued nuke.Events event, delivered from World::Update under
-    // the game lock — enter the VM directly: onEvent(self, name, payload). Filter by name
-    // in the script; scripts without the function pay one table lookup.
+    // Event-bus delivery -> script's onEvent(self, name, payload); called from World::Update
+    // under the game lock.
     void OnEvent(const std::string& name, const std::string& payload) override
     {
         if (!EnsureLoaded()) return;
@@ -1086,11 +1028,9 @@ public:
         }
     }
 
-    // Savegame v2 (6.6): capture the LIVE exported props at save time. The script picks
-    // the policy via table fields: `saveMode` = "all" (default — the whole live props
-    // table) | "none" (keep the configured values) | "marked" (+ `saveFields = {"hp",...}`
-    // — only those keys, merged over the configured props). A script that never loaded
-    // keeps its serialized props untouched (no VM entry during a plain editor save).
+    // Captures the live exported props at save time. The script's `saveMode` field picks the
+    // policy: "all" (default), "none", or "marked" with `saveFields = {...}` merged over the
+    // configured props. A script that never loaded keeps its serialized props untouched.
     void OnBeforeSave() override
     {
         if (!table || !propsTable) return;
@@ -1151,9 +1091,8 @@ private:
         }
     }
 
-    // One-shot `start(self)` hook: fires once per LOADED CHUNK, before the first
-    // update/fixedUpdate. Clear() resets it, so a script reload (edit, PIE restart)
-    // runs start again — same lifecycle as the C# Electron.Start.
+    // Fires the script's `start(self)` once per loaded chunk, before the first update.
+    // Clear() resets the flag, so a reload runs start again.
     void RunStartOnce()
     {
         if (started || !table) return;
@@ -1179,15 +1118,13 @@ private:
     bool EnsureLoaded()
     {
         EnsureLua();
-        // Attempt a given path ONCE (success OR failure). Without this, a missing/broken script
-        // re-reads and logs every frame. Changing the `script` field re-triggers a load.
+        // Each path is attempted once, success or failure — otherwise a broken script logs every frame.
         if (script == loadedScript)
             return table != nullptr;
         Clear();
         loadedScript = script;
 
-        // Read through the engine's content layers: the raw project/overlay from disk,
-        // mounted paks from MEMORY (a packed game never lays scripts out on disk).
+        // Read through the content layers: a packed game serves scripts from a pak in memory.
         std::string resolved = script;
         std::string src;
         AppInstance::GetSingleton()->ReadContent(script, src);
@@ -1215,9 +1152,8 @@ private:
         return true;
     }
 
-    // Atom-ref prop values: a live Atom PROXY in the table (assigned), or the sentinel
-    // `{ __atomref = <id> }` (empty / not-yet-resolved — the id survives resaves).
-    // Returns -1 when the value is NOT an atom ref at all.
+    // Atom id behind a prop value: a live Atom, or the `{ __atomref = <id> }` sentinel.
+    // Returns -1 when the value is not an atom ref at all.
     static long long AtomRefId(const lb::LuaRef& val)
     {
         if (val.isUserdata() && val.isInstance<Atom>())
@@ -1321,17 +1257,11 @@ private:
     }
 };
 
-// Modular reflection: nukegen scans THIS file's [[nuke::prop]]-tagged components and emits the
-// registration into NukeScript.gen.inc (in-TU — the class is defined above, member pointers resolve).
-// Registers into the engine's shared registry, so a world deserialized right after InitModules knows
-// the type. Called synchronously from OnLoad (before Run spawns), so there's no registration race.
+// Generated registration for this file's reflected components; must be included IN THIS TU,
+// after the class definitions, so the member pointers resolve.
 #include "NukeScript.gen.inc"   // defines NukeReflectInit_NukeScript()
 
-// ----------------------------------------------------------------------------
-// Plugin
-// ----------------------------------------------------------------------------
-// The scripting service implementation (iScript, kServiceName "scripting"): snippets run
-// in the SAME shared VM as ScriptComponents, so a console line can poke live script state.
+// iScript service ("scripting"): snippets run in the SAME shared VM as ScriptComponents.
 struct LuaScriptService : public iScript
 {
     const char* Language() override { return "lua"; }
@@ -1365,20 +1295,14 @@ struct NukeScriptModule : public NUKEModule
         tags = { "lua", "scripting", "gameplay" };
     }
 
-    // Service metadata: scripting is a SHARED service — several backends (this Lua one,
-    // C#/Mono, native plugins) may be live at once, each with its own component types and
-    // file formats. The loader registers queryService() under "scripting"; consumers use
-    // GetService<iScript>() (first) / GetServices<iScript>() (all) / the Script facade.
+    // Scripting is a SHARED service: several backends may be live at once, so consumers use
+    // GetServices<iScript>() as well as GetService<iScript>().
     const char* provides() override { return "scripting"; }
     void*       queryService() override { return static_cast<iScript*>(&gScriptService); }
     bool        sharedService() override { return true; }
 
-    // Shipping cooker (3.2): .lua sources are THIS module's domain — the editor packs them
-    // only because we claim them, and we report what they use: every quoted literal is a
-    // potential asset reference (Game.LoadWorld / Audio.Play / getComponent props / ...);
-    // the editor resolves each against ResDB guids + content paths and walks recursively.
-    // Dynamically composed strings are invisible statically — projects force-include those
-    // via "packInclude" in the .nuproj.
+    // Shipping cooker: claims .lua and reports every quoted literal as a potential asset
+    // reference for the editor to resolve. Composed strings need "packInclude" in the .nuproj.
     bool cookContent(const char* contentRel, const char* bytes, uint64_t size,
                      std::vector<std::string>& outUses) override
     {
@@ -1401,14 +1325,13 @@ struct NukeScriptModule : public NUKEModule
         return true;   // .lua is ours — it ships (with the scripting module present)
     }
 
-    // Activation hook (sync, before Run). Register ScriptComponent here so the type only
-    // exists while the plugin is enabled — disabled, its components stay inert placeholders.
+    // Activation hook, called synchronously before Run: registers ScriptComponent and the
+    // .lua asset type, so they exist only while the plugin is enabled.
     void OnLoad() override
     {
         NukeReflectInit_NukeScript();   // register this module's reflected components (generated)
         cout << "[NukeScript]\tScriptComponent registered." << endl;
-        // Full file-type descriptor for .lua (the editor does the actual file IO — no boost
-        // here): New-menu entry under "Scripts", text-editable, "lua" syntax highlighting.
+        // File-type descriptor for .lua; the editor does the actual file IO.
         nuke::AssetCreator luaType;
         luaType.label = "Lua Script";
         luaType.ext = ".lua";
