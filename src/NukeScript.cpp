@@ -7,6 +7,7 @@
 
 #include <interface/NUKEEInteface.h>   // NUKEModule + AppInstance
 #include <interface/AssetCreators.h>   // register a "New Lua Script" browser command (data only)
+#include <interface/IconsFileTypes.h>    // ICON_FT_*: the glyph vocabulary a file type can claim
 #include <interface/iGUI.h>            // runtime GUI facade (scripts' gui() draws via this)
 #include <service/iScript.h>           // the scripting SERVICE contract this plugin provides
 #include <reflect/Reflect.h>
@@ -17,6 +18,11 @@
 #include <API/Model/World.h>           // World::Settings (fixedUpdate dt) + game lock
 #include <API/Model/Audio.h>           // sound content: PlayData blob channel
 
+#include <thread>
+#include <chrono>
+#include <boost/filesystem.hpp>
+#include <set>
+#include <API/Model/Package.h>   // packed sessions: scripts live in mounted paks
 #include <lua.hpp>
 #include <LuaBridge/LuaBridge.h>
 #include <nlohmann/json.hpp>          // persist edited prop values
@@ -30,6 +36,7 @@
 
 using namespace std;
 using namespace nuke;
+namespace bfs = boost::filesystem;
 namespace lb = luabridge;
 using json = nlohmann::json;
 
@@ -1149,7 +1156,30 @@ private:
             defaultsJson = TableToJson(propsTable).dump();   // capture script defaults first
             ApplySavedProps();                                // then overlay saved edits
         }
+        PublishClass();   // this script + its props enter the SHARED reflection registry
         return true;
+    }
+
+    // Publish the loaded script as a script CLASS: reflection-driven editor UI (the animation
+    // and sequencer prop pickers) then offers its props exactly like native reflected ones.
+    void PublishClass()
+    {
+        ScriptClass sc;
+        sc.name = sc.selector = script;
+        sc.component = "ScriptComponent";
+        if (propsTable && !propsTable->isNil())
+            for (lb::Iterator it(*propsTable); !it.isNil(); ++it)
+            {
+                ScriptProp sp;
+                sp.name = it.key().tostring();
+                const NukeVar v = ToVar(it.value());
+                if      (v.kind == NukeVar::Kind::Number) sp.type = FT::Double;
+                else if (v.kind == NukeVar::Kind::Bool)   sp.type = FT::Bool;
+                else if (v.kind == NukeVar::Kind::String) sp.type = FT::String;
+                else continue;   // atom refs and tables are not keyable values
+                sc.props.push_back(sp);
+            }
+        Reflect_RegisterScriptClass(sc);
     }
 
     // Atom id behind a prop value: a live Atom, or the `{ __atomref = <id> }` sentinel.
@@ -1265,6 +1295,82 @@ private:
 struct LuaScriptService : public iScript
 {
     const char* Language() override { return "lua"; }
+    const char* HostComponent() override { return "ScriptComponent"; }
+    const char* Icon() override { return ICON_FT_LUA; }
+
+    // This backend's classes ARE the project's scripts: a listing (no chunk runs, no caching,
+    // no watcher) answered when someone asks. Extension and layout are this module's business,
+    // which is why the engine never spells either out.
+    int ListClasses(char* buf, int cap) override
+    {
+        AppInstance* app = AppInstance::GetSingleton();
+        if (!app) return 0;
+        std::set<std::string> rel;                  // sorted + de-duped across layers
+        boost::system::error_code ec;
+        const bfs::path croot(app->contentRoot);
+        auto isLua = [](std::string e)
+        {
+            for (char& c : e) c = (char)tolower((unsigned char)c);
+            return e == ".lua";
+        };
+        if (!croot.empty() && bfs::exists(croot, ec))
+            for (bfs::recursive_directory_iterator it(croot, ec), end; it != end; it.increment(ec))
+            {
+                if (ec) break;
+                if (bfs::is_directory(it->path(), ec) || !isLua(it->path().extension().string())) continue;
+                rel.insert(bfs::relative(it->path(), croot, ec).generic_string());
+            }
+        // packed session: the scripts live in mounted paks instead
+        if (Package::MountedCount() > 0)
+            for (const std::string& pr : Package::List("content/"))
+                if (isLua(bfs::path(pr).extension().string()))
+                    rel.insert(pr.substr(strlen("content/")));
+        std::string out;
+        for (const std::string& r : rel) out += r + '\n';
+        if (out.empty()) return 0;
+        if (buf && cap >= (int)out.size()) memcpy(buf, out.data(), out.size());
+        return (int)out.size();
+    }
+
+    // The props of ONE script, asked for by the editor when the user picks that script (no
+    // background work, no project sweep): the chunk loads into a scratch state that only
+    // returns its table, and the `props` entries become "name<TAB>kind" lines.
+    int ListClassProps(const char* cls, char* buf, int cap) override
+    {
+        AppInstance* app = AppInstance::GetSingleton();
+        std::string src;
+        if (!app || !cls || !*cls || !app->ReadContent(cls, src)) return 0;
+        lua_State* L = luaL_newstate();
+        if (!L) return 0;
+        luaL_openlibs(L);
+        std::string out;
+        if (luaL_loadbuffer(L, src.data(), src.size(), cls) == LUA_OK
+            && lua_pcall(L, 0, 1, 0) == LUA_OK && lua_istable(L, -1))
+        {
+            lua_getfield(L, -1, "props");
+            if (lua_istable(L, -1))
+            {
+                lua_pushnil(L);
+                while (lua_next(L, -2))
+                {
+                    if (lua_type(L, -2) == LUA_TSTRING)
+                    {
+                        const int vt = lua_type(L, -1);
+                        const char* kind = vt == LUA_TNUMBER  ? "number"
+                                         : vt == LUA_TBOOLEAN ? "bool"
+                                         : vt == LUA_TSTRING  ? "string" : nullptr;
+                        if (kind) { out += lua_tostring(L, -2); out += '\t'; out += kind; out += '\n'; }
+                    }
+                    lua_pop(L, 1);
+                }
+            }
+            lua_pop(L, 1);
+        }
+        lua_close(L);
+        if (out.empty()) return 0;
+        if (buf && cap >= (int)out.size()) memcpy(buf, out.data(), out.size());
+        return (int)out.size();
+    }
 
     bool Run(const char* code, const char* chunkName) override
     {
@@ -1335,6 +1441,7 @@ struct NukeScriptModule : public NUKEModule
         nuke::AssetCreator luaType;
         luaType.label = "Lua Script";
         luaType.ext = ".lua";
+        luaType.icon = ICON_FT_LUA;   // this module owns the type, so it names the glyph
         luaType.baseName = "New Script";
         luaType.category = "Scripts";
         luaType.textEditable = true;
@@ -1383,6 +1490,8 @@ struct NukeScriptModule : public NUKEModule
     {
         instance = inst;
         stopped = false;
+        while (!stopped)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     bool HasSettings() override { return false; }
