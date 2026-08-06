@@ -15,14 +15,15 @@ set(VCPKG_INSTALLED "$ENV{VCPKG_ROOT}/installed/x64-windows")   # VCPKG_ROOT env
 # generate an in-TU .inc that registers the module's components into the engine registry — same
 # mechanism as the core, so no hand-written MakeField. NukeScript.cpp #includes the .inc + calls the
 # generated NukeReflectInit_NukeScript() from OnLoad. Regenerated whenever the source changes.
-find_program(NUKE_PYTHON NAMES python python3 REQUIRED)
+set(NUKE_GEN "${NUKE_ROOT}/NukeUtils/bin/NukeGen.exe")   # built FIRST by the superbuild
 set(NUKESCRIPT_GEN "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeScript.gen.inc")
 add_custom_command(
     OUTPUT  "${NUKESCRIPT_GEN}"
-    COMMAND "${NUKE_PYTHON}" "${NUKE_ROOT}/NukeUtils/nukegen.py"
+    COMMAND "${NUKE_GEN}"
             --include NukeScript/src --out NukeScript/src/NukeScript.gen.inc
             --init NukeReflectInit_NukeScript --scan-cpp --no-includes
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeScript.cpp" "${NUKE_ROOT}/NukeUtils/nukegen.py"
+            --sdk "${NUKE_ROOT}/NukeUtils/sdk/nukesdk/NukeScript.sdk.h" --doc "${NUKE_ROOT}/NukeUtils/sdkdocs/NukeScript.md"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeScript.cpp" "${NUKE_GEN}"
     WORKING_DIRECTORY "${NUKE_ROOT}"
     COMMENT "nukegen: NukeScript modular reflection"
     VERBATIM)
