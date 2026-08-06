@@ -10,6 +10,7 @@
 #include <interface/IconsFileTypes.h>    // ICON_FT_*: the glyph vocabulary a file type can claim
 #include <interface/iGUI.h>            // runtime GUI facade (scripts' gui() draws via this)
 #include <service/iScript.h>           // the scripting SERVICE contract this plugin provides
+#include <interface/Modular.h>         // PluginOwnedTypes: which classes came from which plugin
 #include <reflect/Reflect.h>
 #include <reflect/ReflectBind.h>       // reflection->script layer: generic component access (0.8)
 #include <API/Model/Atom.h>
@@ -21,6 +22,7 @@
 #include <thread>
 #include <chrono>
 #include <boost/filesystem.hpp>
+#include <boost/filesystem/fstream.hpp>
 #include <set>
 #include <API/Model/Package.h>   // packed sessions: scripts live in mounted paks
 #include <lua.hpp>
@@ -1370,6 +1372,86 @@ struct LuaScriptService : public iScript
         if (out.empty()) return 0;
         if (buf && cap >= (int)out.size()) memcpy(buf, out.data(), out.size());
         return (int)out.size();
+    }
+
+    // Which engine plugins a .lua file needs. Only this backend can answer: it is the one that
+    // binds plugin-owned classes into the global table, so a bare global by that name IS the
+    // dependency. Comments and string literals are skipped — Lua syntax is this module's business.
+    int ModuleDeps(const char* path, char* buf, int cap) override
+    {
+        if (!path) return 0;
+        std::string ext = bfs::path(path).extension().string();
+        for (char& c : ext) c = (char)tolower((unsigned char)c);
+        if (ext != ".lua") return 0;                       // not ours: nothing was read
+
+        bfs::ifstream in(bfs::path(path), std::ios::binary);
+        if (!in) return 0;
+        // Blank out what is not code, so a name in a comment is not a dependency.
+        std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (src.empty()) return 0;
+        // Level-0 long bracket [[...]] — the shared body of block comments and long strings.
+        // (Levelled [=[ forms are rare in gameplay scripts and not chased.)
+        auto blankLong = [&src](size_t at, size_t& i) -> bool
+        {
+            if (at + 1 >= src.size() || src[at] != '[' || src[at + 1] != '[') return false;
+            size_t end = src.find("]]", at + 2);
+            end = (end == std::string::npos) ? src.size() : end + 2;
+            for (size_t k = at; k < end; ++k) if (src[k] != '\n') src[k] = ' ';
+            i = end;
+            return true;
+        };
+        for (size_t i = 0; i < src.size(); )
+        {
+            if (src[i] == '-' && i + 1 < src.size() && src[i + 1] == '-')
+            {
+                // A block comment runs to its ]] — a line comment to the newline.
+                src[i] = src[i + 1] = ' ';
+                if (blankLong(i + 2, i)) continue;
+                while (i < src.size() && src[i] != '\n') src[i++] = ' ';
+            }
+            else if (src[i] == '[' && blankLong(i, i)) continue;
+            else if (src[i] == '"' || src[i] == '\'')
+            {
+                const char q = src[i]; src[i++] = ' ';
+                while (i < src.size() && src[i] != q)
+                {
+                    if (src[i] == '\\' && i + 1 < src.size()) src[i++] = ' ';
+                    src[i++] = ' ';
+                }
+                if (i < src.size()) src[i++] = ' ';
+            }
+            else ++i;
+        }
+        auto ident = [](char c) { return isalnum((unsigned char)c) != 0 || c == '_'; };
+        std::set<std::string> mods;
+        for (const auto& t : nuke::PluginOwnedTypes())
+        {
+            for (size_t p = src.find(t.first); p != std::string::npos; p = src.find(t.first, p + 1))
+            {
+                const size_t e = p + t.first.size();
+                if ((p == 0 || !ident(src[p - 1])) && (e >= src.size() || !ident(src[e])))
+                { mods.insert(t.second); break; }
+            }
+        }
+        std::string out;
+        for (const std::string& m : mods) out += m + '\n';
+        if (out.empty()) return 0;
+        if (buf && cap >= (int)out.size()) memcpy(buf, out.data(), out.size());
+        return (int)out.size();
+    }
+
+    // Lua source is text and this backend runs it identically everywhere, so a .lua file never
+    // binds its package to a platform. Claiming it is the point: it stops the host from judging
+    // the file by cruder means.
+    int PlatformOf(const char* path, char* buf, int cap) override
+    {
+        if (!path) return 0;
+        std::string ext = bfs::path(path).extension().string();
+        for (char& c : ext) c = (char)tolower((unsigned char)c);
+        if (ext != ".lua") return 0;
+        const int n = 3;
+        if (buf && cap >= n) memcpy(buf, "any", n);
+        return n;
     }
 
     bool Run(const char* code, const char* chunkName) override
