@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(NukeScript C CXX)   # C too — the vendored lua sources are C
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/../NukeEngine/cmake/NukeRunDir.cmake")   # NUKE_RUN_SUBDIR: x64 / macos / linux
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
