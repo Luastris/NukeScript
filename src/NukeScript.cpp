@@ -29,6 +29,7 @@
 #include <LuaBridge/LuaBridge.h>
 #include <nlohmann/json.hpp>          // persist edited prop values
 
+#include <algorithm>   // coroutine driver: std::max / std::remove_if
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -880,12 +881,25 @@ static void BindEngineAPI(lua_State* L)
     BindReflectedStatics(L);   // nuke.<Type>.<Fn> for every [[nuke::func]] static (e.g. nuke.Physics.Raycast)
 }
 
+// Coroutine driver plumbing (script async A1): startCoroutine targets the component whose
+// hook is currently on the VM stack (every VM entry holds the game lock, so this can't race).
+class ScriptComponent;
+static ScriptComponent* g_currentScript = nullptr;
+static int Lua_StartCoroutine(lua_State* L);
+
 static void EnsureLua()
 {
     if (gL) return;
     gL = luaL_newstate();
     luaL_openlibs(gL);
     BindEngineAPI(gL);
+    // Wait helpers: plain yields carrying a wait descriptor; the ScriptComponent driver
+    // interprets them. wait() counts GAME seconds (scaled delta — frozen time waits forever).
+    luaL_dostring(gL,
+        "function wait(s)       return coroutine.yield({ __wait = 'time',   t = s or 0 }) end\n"
+        "function waitFrames(n) return coroutine.yield({ __wait = 'frames', n = n or 1 }) end\n"
+        "function waitUntil(f)  return coroutine.yield({ __wait = 'until',  f = f }) end\n");
+    lua_register(gL, "startCoroutine", &Lua_StartCoroutine);
     cout << "[NukeScript]\tLua VM ready." << endl;
 }
 
@@ -920,6 +934,7 @@ public:
         if (!EnsureLoaded()) return;
         RunStartOnce();
         if (!table) return;   // start error tore the chunk down
+        CurScope cs{ this };
         double dt = Time::getSingleton()->gameDelta;   // scaled game delta: 0 while frozen
         lb::LuaRef upd = (*table)["update"];
         if (upd.isFunction())
@@ -929,8 +944,10 @@ public:
             {
                 cerr << "[NukeScript]\tupdate error: " << e.what() << endl;
                 Clear();
+                return;
             }
         }
+        StepCoroutines(dt);
     }
 
     // Calls the script's `fixedUpdate(self, dt)` at the world's fixedDt cadence. Runs on the
@@ -944,6 +961,7 @@ public:
         if (!fu.isFunction()) return;
         World* w = AppInstance::GetSingleton()->currentWorld;
         double dt = (w && w->settings.fixedDt > 0.0001f) ? w->settings.fixedDt : 1.0 / 60.0;
+        CurScope cs{ this };
         try { fu(atom, dt); }
         catch (const lb::LuaException& e)
         {
@@ -1007,6 +1025,7 @@ public:
         lb::LuaRef g = (*table)["gui"];
         if (g.isFunction())
         {
+            CurScope cs{ this };
             try { g(atom); }
             catch (const lb::LuaException& e) { cerr << "[NukeScript]\tgui error: " << e.what() << endl; Clear(); }
         }
@@ -1019,6 +1038,7 @@ public:
         lb::LuaRef h = (*table)["animEvent"];
         if (h.isFunction())
         {
+            CurScope cs{ this };
             try { h(atom, std::string(name ? name : "")); }
             catch (const lb::LuaException& e) { cerr << "[NukeScript]\tanimEvent error: " << e.what() << endl; Clear(); }
         }
@@ -1032,6 +1052,7 @@ public:
         lb::LuaRef h = (*table)["onEvent"];
         if (h.isFunction())
         {
+            CurScope cs{ this };
             try { h(atom, name, payload); }
             catch (const lb::LuaException& e) { cerr << "[NukeScript]\tonEvent error: " << e.what() << endl; Clear(); }
         }
@@ -1080,6 +1101,26 @@ public:
     void Pause() override       {}
     void Reset() override       { Clear(); }
 
+    // startCoroutine(fn): pin a new thread carrying fn; the driver first resumes it in this
+    // frame's StepCoroutines (entries born during a resume start next frame).
+    void AddCoroutine(lua_State* L)
+    {
+        lua_State* T = lua_newthread(L);
+        lua_pushvalue(L, 1);
+        lua_xmove(L, T, 1);                              // the coroutine body moves into the thread
+        Coro c;
+        c.threadRef = luaL_ref(L, LUA_REGISTRYINDEX);    // pops + pins the thread
+        coros.push_back(c);
+    }
+
+    // Marks `this` as the component whose hook runs (the startCoroutine target).
+    struct CurScope
+    {
+        ScriptComponent* prev;
+        CurScope(ScriptComponent* c) : prev(g_currentScript) { g_currentScript = c; }
+        ~CurScope() { g_currentScript = prev; }
+    };
+
 private:
     lb::LuaRef* table = nullptr;        // chunk's returned table
     lb::LuaRef* propsTable = nullptr;   // table["props"] (the exported props)
@@ -1087,12 +1128,127 @@ private:
     std::string loadedScript;           // path the current chunk came from (for reload-on-change)
     std::string defaultsJson;           // script's original prop defaults (for the reset button)
 
+    // ---- coroutines (script async A1) ----
+    struct Coro
+    {
+        int    threadRef = LUA_NOREF;   // registry ref pinning the thread (LUA_NOREF = dead, sweep)
+        int    predRef   = LUA_NOREF;   // waitUntil predicate
+        int    kind      = 0;           // 0 = resume now, 1 = time, 2 = frames, 3 = predicate
+        double seconds   = 0;
+        int    frames    = 0;
+    };
+    std::vector<Coro> coros;
+
+    void KillCoroAt(size_t i)
+    {
+        if (coros[i].threadRef != LUA_NOREF) luaL_unref(gL, LUA_REGISTRYINDEX, coros[i].threadRef);
+        if (coros[i].predRef   != LUA_NOREF) luaL_unref(gL, LUA_REGISTRYINDEX, coros[i].predRef);
+        coros[i].threadRef = coros[i].predRef = LUA_NOREF;
+    }
+
+    bool PredicateTrue(size_t i)
+    {
+        lua_rawgeti(gL, LUA_REGISTRYINDEX, coros[i].predRef);
+        if (lua_pcall(gL, 0, 1, 0) != LUA_OK)
+        {
+            cerr << "[NukeScript]\twaitUntil predicate error: " << lua_tostring(gL, -1) << endl;
+            lua_pop(gL, 1);
+            KillCoroAt(i);   // a broken predicate can never come true
+            return false;
+        }
+        const bool t = lua_toboolean(gL, -1) != 0;
+        lua_pop(gL, 1);
+        return t;
+    }
+
+    // Reads the yielded wait descriptor off the thread stack into the coro's state.
+    void ParseWait(lua_State* T, int nres, size_t i)
+    {
+        if (coros[i].predRef != LUA_NOREF) { luaL_unref(gL, LUA_REGISTRYINDEX, coros[i].predRef); coros[i].predRef = LUA_NOREF; }
+        coros[i].kind = 0;                                   // plain yield = resume next frame
+        if (nres < 1 || !lua_istable(T, -nres)) return;
+        lua_getfield(T, -nres, "__wait");   // index resolves BEFORE the push — -nres is the table
+        const std::string kind = lua_isstring(T, -1) ? lua_tostring(T, -1) : "";
+        lua_pop(T, 1);
+        if (kind == "time")
+        {
+            lua_getfield(T, -nres, "t");
+            coros[i].kind = 1; coros[i].seconds = lua_tonumber(T, -1);
+            lua_pop(T, 1);
+        }
+        else if (kind == "frames")
+        {
+            lua_getfield(T, -nres, "n");
+            coros[i].kind = 2; coros[i].frames = std::max(1, (int)lua_tointeger(T, -1));
+            lua_pop(T, 1);
+        }
+        else if (kind == "until")
+        {
+            lua_getfield(T, -nres, "f");
+            if (lua_isfunction(T, -1))
+            {
+                lua_xmove(T, gL, 1);
+                coros[i].kind = 3; coros[i].predRef = luaL_ref(gL, LUA_REGISTRYINDEX);
+            }
+            else lua_pop(T, 1);
+        }
+    }
+
+    void ResumeCoro(size_t i)
+    {
+        lua_rawgeti(gL, LUA_REGISTRYINDEX, coros[i].threadRef);
+        lua_State* T = lua_tothread(gL, -1);
+        lua_pop(gL, 1);
+        if (!T) { KillCoroAt(i); return; }
+        int nres = 0;
+        const int rc = lua_resume(T, gL, 0, &nres);
+        if (rc == LUA_YIELD)
+        {
+            ParseWait(T, nres, i);
+            lua_pop(T, nres);
+            return;
+        }
+        if (rc != LUA_OK)   // runtime error: message + the COROUTINE's traceback, then drop it
+        {
+            const char* msg = lua_tostring(T, -1);
+            luaL_traceback(gL, T, msg ? msg : "?", 0);
+            cerr << "[NukeScript]\tcoroutine error: " << lua_tostring(gL, -1) << endl;
+            lua_pop(gL, 1);
+            lua_settop(T, 0);
+        }
+        KillCoroAt(i);   // finished or failed
+    }
+
+    // Once per frame after update(); dt = scaled game delta (frozen time parks time-waits).
+    void StepCoroutines(double dt)
+    {
+        if (coros.empty()) return;
+        const size_t n = coros.size();   // coroutines started DURING a resume begin next frame
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (coros[i].threadRef == LUA_NOREF) continue;
+            bool due = false;
+            switch (coros[i].kind)
+            {
+                case 0: due = true; break;
+                case 1: coros[i].seconds -= dt; due = coros[i].seconds <= 0; break;
+                case 2: due = --coros[i].frames <= 0; break;
+                case 3: due = PredicateTrue(i); break;
+            }
+            if (due && coros[i].threadRef != LUA_NOREF)
+                ResumeCoro(i);
+        }
+        coros.erase(std::remove_if(coros.begin(), coros.end(),
+                    [](const Coro& c) { return c.threadRef == LUA_NOREF; }), coros.end());
+    }
+
     // Direct contact-hook dispatch (fixed thread, game lock held by the caller).
     void CallContactHook(const char* fnName, Atom* other)
     {
         if (!EnsureLoaded()) return;
         lb::LuaRef fn = (*table)[fnName];
         if (!fn.isFunction()) return;
+        CurScope cs{ this };
         try { fn(atom, other); }
         catch (const lb::LuaException& ex)
         {
@@ -1108,6 +1264,7 @@ private:
         started = true;
         lb::LuaRef st = (*table)["start"];
         if (!st.isFunction()) return;
+        CurScope cs{ this };
         try { st(atom); }
         catch (const lb::LuaException& e)
         {
@@ -1118,6 +1275,10 @@ private:
 
     void Clear()
     {
+        // Coroutines die with their chunk (reload/destroy/PIE stop) — release the pins.
+        if (gL)
+            for (size_t i = 0; i < coros.size(); ++i) KillCoroAt(i);
+        coros.clear();
         delete table;      table = nullptr;
         delete propsTable; propsTable = nullptr;
         started = false;
@@ -1288,6 +1449,17 @@ private:
         for (auto& kv : j.items()) SetProp(kv.key(), kv.value());
     }
 };
+
+// startCoroutine(fn) — registered in EnsureLua; targets the component whose hook runs.
+static int Lua_StartCoroutine(lua_State* L)
+{
+    if (!g_currentScript)
+        return luaL_error(L, "startCoroutine: callable only from inside a script hook");
+    if (!lua_isfunction(L, 1))
+        return luaL_error(L, "startCoroutine(fn): function expected");
+    g_currentScript->AddCoroutine(L);
+    return 0;
+}
 
 // Generated registration for this file's reflected components; must be included IN THIS TU,
 // after the class definitions, so the member pointers resolve.
@@ -1547,6 +1719,15 @@ struct NukeScriptModule : public NUKEModule
             "        -- mr.material.diffuse = tex\n"
             "        -- Content bytes (raw project or pak): nuke.Packages.read(\"path\")\n"
             "    end,\n"
+            "    -- Coroutines: straight-line logic that WAITS mid-function (runtime-only,\n"
+            "    -- dies with the component; for saved timers use nuke.Events.After):\n"
+            "    -- start = function(self)\n"
+            "    --     startCoroutine(function()\n"
+            "    --         wait(2)               -- game seconds (timescale applies)\n"
+            "    --         waitFrames(1)\n"
+            "    --         waitUntil(function() return self.name == \"Ready\" end)\n"
+            "    --     end)\n"
+            "    -- end,\n"
             "    -- Fixed-rate tick (physics cadence, frame-independent):\n"
             "    -- fixedUpdate = function(self, dt) end,\n"
             "    -- Physics hooks (need a Collider on this atom):\n"
