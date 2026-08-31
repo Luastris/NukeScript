@@ -22,9 +22,7 @@ set(NUKESCRIPT_GEN "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeScript.gen.inc")
 add_custom_command(
     OUTPUT  "${NUKESCRIPT_GEN}"
     COMMAND "${NUKE_GEN}"
-            --include NukeScript/src --out NukeScript/src/NukeScript.gen.inc
-            --init NukeReflectInit_NukeScript --scan-cpp --no-includes
-            --sdk "${NUKE_ROOT}/NukeUtils/sdk/nukesdk/NukeScript.sdk.h" --doc "${NUKE_ROOT}/NukeUtils/sdkdocs/NukeScript.md"
+            --module "${CMAKE_CURRENT_SOURCE_DIR}"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeScript.cpp" "${NUKE_GEN}"
     WORKING_DIRECTORY "${NUKE_ROOT}"
     COMMENT "nukegen: NukeScript modular reflection"
