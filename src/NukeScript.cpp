@@ -962,6 +962,7 @@ public:
         if (!fu.isFunction()) return;
         World* w = AppInstance::GetSingleton()->currentWorld;
         double dt = (w && w->settings.fixedDt > 0.0001f) ? w->settings.fixedDt : 1.0 / 60.0;
+        dt *= Time::LocalScale();   // local time (TimeVolume): the atom's multiplier
         CurScope cs{ this };
         try { fu(atom, dt); }
         catch (const lb::LuaException& e)
