@@ -25,6 +25,7 @@
 #include <boost/filesystem/fstream.hpp>
 #include <set>
 #include <API/Model/Package.h>   // packed sessions: scripts live in mounted paks
+#include <API/Model/FileIndex.h> // raw sessions: the indexed content root, no disk walk
 #include <lua.hpp>
 #include <LuaBridge/LuaBridge.h>
 #include <nlohmann/json.hpp>          // persist edited prop values
@@ -1487,7 +1488,16 @@ struct LuaScriptService : public iScript
             for (char& c : e) c = (char)tolower((unsigned char)c);
             return e == ".lua";
         };
-        if (!croot.empty() && bfs::exists(croot, ec))
+        std::string relRoot;
+        const std::string rn = croot.empty() ? std::string() : FileIndex::Get().RootOf(croot.string(), &relRoot);
+        auto snap = (!rn.empty() && relRoot.empty()) ? FileIndex::Get().Get(rn) : nullptr;
+        if (snap)   // the content root is indexed: answer from the snapshot
+        {
+            std::vector<const FileIndex::Entry*> found;
+            snap->WithExtension(".lua", found);
+            for (const FileIndex::Entry* e : found) rel.insert(e->rel);
+        }
+        else if (!croot.empty() && bfs::exists(croot, ec))   // an unindexed root (tools, tests)
             for (bfs::recursive_directory_iterator it(croot, ec), end; it != end; it.increment(ec))
             {
                 if (ec) break;
