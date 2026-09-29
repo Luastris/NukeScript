@@ -16,6 +16,7 @@
 #include <API/Model/Atom.h>
 #include <API/Model/Transform.h>
 #include <API/Model/Time.h>
+#include <API/Model/Migrations.h>   // the game's savegame upgrader (a Lua global)
 #include <API/Model/World.h>           // World::Settings (fixedUpdate dt) + game lock
 #include <API/Model/Audio.h>           // sound content: PlayData blob channel
 
@@ -794,6 +795,71 @@ static lb::LuaRef ReflectedNewIndex(void* obj, TypeInfo* ti, const lb::LuaRef& k
     return lb::LuaRef(L);
 }
 
+// JSON <-> Lua (recursive, raw API). A table is an array when its keys are exactly 1..n.
+static void PushJson(lua_State* L, const json& j)
+{
+    switch (j.type())
+    {
+    case json::value_t::null:    lua_pushnil(L); break;
+    case json::value_t::boolean: lua_pushboolean(L, j.get<bool>()); break;
+    case json::value_t::number_integer:  lua_pushinteger(L, (lua_Integer)j.get<long long>()); break;
+    case json::value_t::number_unsigned: lua_pushinteger(L, (lua_Integer)j.get<unsigned long long>()); break;
+    case json::value_t::number_float:    lua_pushnumber(L, j.get<double>()); break;
+    case json::value_t::string:  { const std::string& v = j.get_ref<const std::string&>(); lua_pushlstring(L, v.data(), v.size()); break; }
+    case json::value_t::array:
+        lua_createtable(L, (int)j.size(), 0);
+        for (size_t i = 0; i < j.size(); ++i) { PushJson(L, j[i]); lua_rawseti(L, -2, (lua_Integer)i + 1); }
+        break;
+    case json::value_t::object:
+        lua_createtable(L, 0, (int)j.size());
+        for (auto it = j.begin(); it != j.end(); ++it) { PushJson(L, it.value()); lua_setfield(L, -2, it.key().c_str()); }
+        break;
+    default: lua_pushnil(L); break;
+    }
+}
+static json LuaToJson(lua_State* L, int idx)
+{
+    idx = lua_absindex(L, idx);
+    switch (lua_type(L, idx))
+    {
+    case LUA_TNIL:     return json();
+    case LUA_TBOOLEAN: return json(lua_toboolean(L, idx) != 0);
+    case LUA_TNUMBER:  return lua_isinteger(L, idx) ? json((long long)lua_tointeger(L, idx)) : json(lua_tonumber(L, idx));
+    case LUA_TSTRING:  { size_t n = 0; const char* sv = lua_tolstring(L, idx, &n); return json(std::string(sv, n)); }
+    case LUA_TTABLE:
+    {
+        const lua_Integer n = (lua_Integer)lua_rawlen(L, idx);
+        bool sequence = n > 0;
+        if (sequence)
+        {
+            lua_Integer count = 0;
+            lua_pushnil(L);
+            while (lua_next(L, idx)) { lua_pop(L, 1); ++count; if (!lua_isinteger(L, -1) || lua_tointeger(L, -1) < 1 || lua_tointeger(L, -1) > n) { sequence = false; lua_pop(L, 1); break; } }
+            if (sequence && count != n) sequence = false;
+        }
+        if (sequence)
+        {
+            json a = json::array();
+            for (lua_Integer i = 1; i <= n; ++i) { lua_rawgeti(L, idx, i); a.push_back(LuaToJson(L, -1)); lua_pop(L, 1); }
+            return a;
+        }
+        json o = json::object();
+        lua_pushnil(L);
+        while (lua_next(L, idx))
+        {
+            std::string key;
+            if (lua_type(L, -2) == LUA_TSTRING) { size_t kn = 0; const char* ks = lua_tolstring(L, -2, &kn); key.assign(ks, kn); }
+            else if (lua_isinteger(L, -2)) key = std::to_string(lua_tointeger(L, -2));
+            else { lua_pop(L, 1); continue; }
+            o[key] = LuaToJson(L, -1);
+            lua_pop(L, 1);
+        }
+        return o;
+    }
+    default: return json();
+    }
+}
+
 static void BindEngineAPI(lua_State* L)
 {
     RegisterComponentProxy(L);
@@ -866,6 +932,27 @@ static void BindEngineAPI(lua_State* L)
                     t["__atomref"] = 0;
                     return t;
                 })
+        // nuke.json: JSON text <-> Lua tables (objects = string keys, arrays = 1..n sequences; an
+        // empty table dumps as {}). parse returns nil, error on bad text.
+        .beginNamespace("json")
+            .addFunction("parse", +[](lua_State* L) -> int
+            {
+                size_t n = 0; const char* text = luaL_checklstring(L, 1, &n);
+                json j = json::parse(std::string(text, n), nullptr, false);
+                if (j.is_discarded()) { lua_pushnil(L); lua_pushstring(L, "not valid JSON"); return 2; }
+                PushJson(L, j);
+                return 1;
+            })
+            .addFunction("dump", +[](lua_State* L) -> int
+            {
+                luaL_checkany(L, 1);
+                const bool pretty = lua_toboolean(L, 2) != 0;
+                json j = LuaToJson(L, 1);
+                std::string out = pretty ? j.dump(2) : j.dump();
+                lua_pushlstring(L, out.data(), out.size());
+                return 1;
+            })
+        .endNamespace()
         .endNamespace()
         // Legacy alias namespace for older scripts; the reflected surface is nuke.Gui.*.
         .beginNamespace("gui")
@@ -1701,6 +1788,21 @@ struct NukeScriptModule : public NUKEModule
     void OnLoad() override
     {
         NukeReflectInit_NukeScript();   // register this module's reflected components (generated)
+        // Savegame migrations: a game defines `function saveUpgrade(from, to, json) return json end`
+        // (any script file, top level) and older saves pass through it on load.
+        nuke::Migrations::AddSaveTextUpgrader([](int from, int to, std::string& text) -> int
+        {
+            EnsureLua();
+            lua_getglobal(gL, "saveUpgrade");
+            if (!lua_isfunction(gL, -1)) { lua_pop(gL, 1); return 0; }
+            lua_pushinteger(gL, from); lua_pushinteger(gL, to); lua_pushlstring(gL, text.data(), text.size());
+            if (lua_pcall(gL, 3, 1, 0) != LUA_OK) { cerr << "[NukeScript]\tsaveUpgrade error: " << lua_tostring(gL, -1) << endl; lua_pop(gL, 1); return -1; }
+            if (lua_type(gL, -1) != LUA_TSTRING) { lua_pop(gL, 1); return -1; }   // nil / false = refuse the save
+            size_t n = 0; const char* out = lua_tolstring(gL, -1, &n);
+            text.assign(out, n);
+            lua_pop(gL, 1);
+            return 1;
+        });
         cout << "[NukeScript]\tScriptComponent registered." << endl;
         // File-type descriptor for .lua; the editor does the actual file IO.
         nuke::AssetCreator luaType;
