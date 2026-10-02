@@ -893,6 +893,8 @@ static void BindEngineAPI(lua_State* L)
                 .addProperty("name",
                     [](const Atom* a) { return a->name; },
                     [](Atom* a, const std::string& n) { a->name = n; })
+                .addProperty("id",
+                    [](const Atom* a) { return (double)a->id.id; })   // stable unique id (event payloads, GetById)
                 .addProperty("tag",
                     [](const Atom* a) { return a->tag; },
                     [](Atom* a, const std::string& t) { a->tag = t; })
